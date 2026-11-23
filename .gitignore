@@ -1,0 +1,32 @@
+# --- Personal data: NEVER commit (architecture amendment A2) ---
+data/
+personal/
+snapshots/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-*
+.env
+.env.*
+!.env.example
+config/careeros.yaml
+*.pem
+*.key
+
+# --- Python / tooling ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+var/

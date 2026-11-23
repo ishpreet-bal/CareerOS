@@ -1,0 +1,73 @@
+"""Interfaces for personal-data storage.
+
+Workers and the manager depend on these protocols, not on SQLite, so a secure persistent
+backend can replace ``SQLitePersonalStore`` / ``LocalBlobStore`` later without other changes.
+No paid or remote backend is selected (amendment A2).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
+from careeros.domain.models import (
+    Application,
+    ApplicationEvent,
+    ApplicationStatus,
+    CandidateProfile,
+    Document,
+    FactCategory,
+    ProfileFact,
+    Skill,
+    WorkAuthorization,
+)
+
+
+@dataclass(frozen=True)
+class BlobRef:
+    key: str
+    sha256: str
+    size: int
+
+
+@runtime_checkable
+class BlobStore(Protocol):
+    def put(self, data: bytes, *, suffix: str = "") -> BlobRef: ...
+    def get(self, key: str) -> bytes: ...
+    def exists(self, key: str) -> bool: ...
+    def delete(self, key: str) -> None: ...
+
+
+@runtime_checkable
+class PersonalDataStore(Protocol):
+    # profile ------------------------------------------------------------
+    def save_profile(self, profile: CandidateProfile) -> CandidateProfile: ...
+    def get_profile(self) -> CandidateProfile | None: ...
+
+    # work authorization (A3) ---------------------------------------------
+    def set_work_authorization(self, auth: WorkAuthorization) -> WorkAuthorization: ...
+    def get_work_authorization(self, profile_id: int, country: str) -> WorkAuthorization: ...
+    def list_work_authorizations(self, profile_id: int) -> list[WorkAuthorization]: ...
+
+    # facts and skills ------------------------------------------------------
+    def add_fact(self, fact: ProfileFact) -> ProfileFact: ...
+    def get_fact(self, fact_id: int) -> ProfileFact: ...
+    def list_facts(
+        self, *, category: FactCategory | None = None, active_only: bool = True
+    ) -> list[ProfileFact]: ...
+    def add_skill(self, skill: Skill) -> Skill: ...
+    def list_skills(self) -> list[Skill]: ...
+
+    # documents ---------------------------------------------------------------
+    def add_document(self, doc: Document, content: bytes | None = None) -> Document: ...
+    def get_document(self, doc_id: int) -> Document: ...
+    def read_document_content(self, doc_id: int) -> bytes: ...
+
+    # applications --------------------------------------------------------------
+    def create_application(self, app: Application) -> Application: ...
+    def get_application(self, app_id: int) -> Application: ...
+    def list_applications(self, status: ApplicationStatus | None = None) -> list[Application]: ...
+    def update_application_status(
+        self, app_id: int, status: ApplicationStatus, *, details: dict[str, object] | None = None
+    ) -> Application: ...
+    def list_application_events(self, app_id: int) -> list[ApplicationEvent]: ...

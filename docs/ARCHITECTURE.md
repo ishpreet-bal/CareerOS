@@ -1,6 +1,23 @@
-# CareerOS — Architecture & Implementation Plan (v2, proposal)
+# CareerOS — Architecture & Implementation Plan (v3)
 
-Status: **PROPOSAL — awaiting approval. Nothing is implemented, deployed, purchased or configured.**
+Status: **APPROVED (with amendments in §0).** M0 and M1 are in scope; M2+ await review.
+Nothing is deployed, purchased or configured against a paid service.
+
+---
+
+## 0. Approved amendments (2026-11-23)
+
+These decisions override anything below that conflicts with them.
+
+| # | Decision | Where it is applied |
+|---|---|---|
+| A1 | Architecture approved. Keep the provider-neutral router, dynamic decomposition, quality-adjusted cost, bounded escalation, persistent task state, mock adapters and strict spending controls. | Whole document |
+| A2 | **No personal data in GitHub** — no real resumes, profiles, contact details, application histories, credentials or personal database snapshots, even in a private repo. M0/M1 use **synthetic data only**. Personal data sits behind a storage abstraction so secure persistent storage can be added later. No paid storage provider is selected. | §9, §10.0, §11 |
+| A3 | **No eligibility assumptions.** Citizenship, permanent residency and work authorization default to `unknown`. Rules are configurable. Unknown inputs produce `needs_user_confirmation`, not a guess. | §4, §10.1, §10.2 |
+| A4 | Free public job-board APIs (Greenhouse, Lever, Ashby) are approved for M6. **Before implementation, verify the current endpoints, rate limits and terms** and record the findings in an ADR. No LinkedIn or Indeed scraping. | §13 (M6) |
+| A5 | Manual AI bridge is an **optional future capability**. It is never required for normal operation. | §6.1 |
+| A6 | GitHub Actions CI runs within the free allowance. No paid CI. Session-based testing stays available. | §11, §13 (M0) |
+| A7 | **Resumable objectives.** The manager does not run continuously, but task execution, results, checkpoints and outstanding work persist and survive the end of any single execution session. | §7.3, §9.3 |
 
 CareerOS is a standalone, local-first career intelligence and internship application agent.
 It shares no code, database, agents, infrastructure or modules with any other project. Ideas
@@ -153,10 +170,10 @@ Workers are **stateless workflow classes**, not running agents. Each is a sequen
 steps:
 
 ```python
-class Step:            # conceptual
+class Step:  # conceptual
     name: str
     mode: Literal["deterministic", "model", "hybrid"]
-    task_type: str     # key into routing policy, e.g. "job.classify_role"
+    task_type: str  # key into routing policy, e.g. "job.classify_role"
     output_schema: type[BaseModel]
     min_tier: int | None
     cacheable: bool
@@ -165,7 +182,7 @@ class Step:            # conceptual
 | Worker | Mostly deterministic | Model steps (default tier) |
 |---|---|---|
 | **Job Discovery** | Fetch public ATS JSON/RSS, normalize, dedupe (hash + fuzzy title/company/location), keyword and location filters | Classifying ambiguous roles ("is this ML?") → T3 |
-| **Eligibility Assessment** | Rules: grad date window, degree level, work-authorization rules, location/remote, term/season | Parsing unusual requirement wording → T3; truly ambiguous cases → T2 |
+| **Eligibility Assessment** | Configurable rules: grad date window, degree level, work-authorization rules, location/remote, term/season. Any rule whose candidate input is `unknown` yields `needs_user_confirmation` (A3) | Parsing unusual requirement wording → T3; truly ambiguous cases → T2. A model never infers the candidate's status |
 | **Employer Research** | Cache lookup, freshness check, source fetch | Summarizing and synthesizing facts with citations → T2; bounded depth |
 | **Candidate Matching** | Skill/keyword overlap, embedding-free TF-IDF similarity, rule scores | Rationale for top candidates only → T2/T3 |
 | **Resume Tailoring** | Select facts by relevance, enforce length and format, render | Bullet rewording limited to selected facts → T2 |
@@ -179,19 +196,20 @@ class Step:            # conceptual
 class Evidence(BaseModel):
     claim: str
     source_type: Literal["profile_fact", "job_posting", "web", "research_cache", "user"]
-    source_ref: str          # fact id, URL, job id ...
+    source_ref: str  # fact id, URL, job id ...
     quote: str | None
+
 
 class WorkerResult(BaseModel):
     schema_version: str
     status: Literal["succeeded", "partial", "failed", "needs_input"]
-    output: dict             # validated against the step's output_schema
+    output: dict  # validated against the step's output_schema
     evidence: list[Evidence]
     assumptions: list[str]
-    confidence: float        # 0..1, self-reported
+    confidence: float  # 0..1, self-reported
     unresolved_questions: list[str]
     recommended_next_steps: list[str]
-    metrics: dict            # tokens, cost, latency, cache hits (filled by the gateway)
+    metrics: dict  # tokens, cost, latency, cache hits (filled by the gateway)
 ```
 
 A model's self-reported confidence is **not trusted alone**. Effective confidence is
@@ -318,6 +336,7 @@ ledger record (tokens, latency, est/actual cost) → budget reconcile → cache 
 ```python
 class ModelAdapter(Protocol):
     provider: str
+
     def estimate_tokens(self, req: ModelRequest) -> TokenEstimate: ...
     async def call(self, req: ModelRequest) -> ModelResponse: ...
     def map_effort(self, effort: Effort) -> dict: ...
@@ -329,7 +348,7 @@ Adapters planned:
 |---|---|---|
 | `mock` | **Built in M2, default** | Seeded, deterministic, schema-valid outputs; simulated tokens and cost |
 | `scripted` | Built in M2 | Fixture-driven responses and **fault injection** (malformed JSON, low confidence, timeouts, rate limits, wrong answers) to test retry and escalation |
-| `manual_bridge` | Built in M4 (optional) | Writes a prompt file and waits for a pasted or uploaded response. Lets you use an AI tool you already have by hand, with no API key. Clearly labeled human-in-the-loop |
+| `manual_bridge` | **Optional future capability** (not before M4; A5) | Exports a task as a self-contained prompt plus the expected JSON schema. You run it in an external AI tool and import the structured result, which is validated like any other `WorkerResult`. The task waits in `awaiting_human` meanwhile. Off by default; no component depends on it |
 | `anthropic`, `openai_compatible`, `ollama` | Interface stubs only; **disabled** | Implemented only after explicit approval (M10). `ollama` would be free but needs a model download and CPU time. It is listed, not assumed |
 
 ### 6.2 Cost tracking
@@ -399,12 +418,18 @@ any non-terminal → CANCELLED | SKIPPED (by replan / done-met)
 - **SQLite in WAL mode.** Writes go through one connection or writer queue to avoid lock contention.
 - **Idempotency:** each task has an `idempotency_key`. Side-effecting steps (file writes) are idempotent, and model calls are cached.
 
-### 7.3 Persistence and recovery
+### 7.3 Persistence and recovery (A7)
 
-- A `RUNNING` task holds a **lease** (`lease_owner`, `lease_expires_at`) renewed by a heartbeat.
-- On startup, or with `careeros resume`, expired leases → `READY` with `attempt += 1` (still bounded by `max_attempts`).
-- Partial results are stored per attempt in `task_results`, so nothing finished is recomputed.
-- Because cloud containers are ephemeral, `careeros snapshot` exports the database (§9), and tasks are designed to be resumable from any snapshot.
+The manager is invoked, does work, and exits. Everything needed to continue is in the database:
+
+- **Objectives, plans (versioned), tasks, dependencies, results, reviews, decisions, checkpoints** are written as they happen, inside transactions, before any dependent step proceeds.
+- A `RUNNING` task holds a **lease** (`lease_owner` = execution-session id, `lease_expires_at`) renewed by a heartbeat. Every invocation registers itself in `execution_sessions`.
+- **Checkpoints:** a multi-step worker writes a `task_checkpoints` row after each step (step name, state JSON). A retried task restarts from its last checkpoint, not from scratch.
+- On `careeros resume` (or any `run`), expired leases → `READY` with `attempt += 1` (bounded by `max_attempts`). Objectives that are `active` with no runnable tasks are re-evaluated against their definition of done.
+- Model-call results are cached, so a re-run step that already got an answer does not pay again.
+- **Outstanding work** (`ready`, `retry_scheduled`, `awaiting_human`) is listed by `careeros status`.
+
+This survives the end of a process or execution session. Surviving the end of a *cloud container* depends on where the store lives (§9.3).
 
 ### 7.4 Independent quality review
 
@@ -431,18 +456,45 @@ Routing quality priors are updated from these outcomes (§5.6).
 
 ---
 
-## 9. Data persistence and privacy (needs your decision)
+## 9. Data storage and privacy (A2, A7)
 
-The cloud container is reclaimed after inactivity, so a SQLite file alone would be lost.
-Proposed approach:
+### 9.1 Rules
 
-- **Source-of-truth files you edit** live in `workspace/` (your profile as YAML/Markdown, writing samples, application notes) and are committed to the **private** repo.
-- **SQLite** (`data/careeros.db`) is a working store. It can be rebuilt from `workspace/` and from `careeros snapshot` exports (a compressed SQL dump in `workspace/snapshots/`, committed).
-- Caches and large fetched pages are disposable and gitignored.
-- No secrets are ever committed. `.env` is gitignored.
+- **Never committed to git:** real resumes, profiles, contact details, writing samples, application histories, credentials, API keys, `.env`, personal databases or snapshots of them.
+- The repo holds only code, configuration templates, documentation and **synthetic** fixtures (fictional people at fictional `example.com` addresses).
+- `.gitignore` excludes `data/`, `personal/`, `*.db`, `*.sqlite*`, `snapshots/`, `.env*`. A CI test fails if a tracked file matches those patterns.
 
-Even with a private repo, this means your resume data is stored on GitHub. Alternatives: commit
-only non-sensitive data, or keep the profile outside git and upload it each session.
+### 9.2 Storage abstraction
+
+```
+           ┌──────────────────────────── careeros.storage ───────────────────────────┐
+ domain ──▶│ StorageConfig: data_dir, dataset_kind (synthetic | personal), backend   │
+ repos     │ resolve_data_dir(): refuses any location inside the git working tree    │
+           │                                                                         │
+           │ PersonalDataStore (Protocol)        BlobStore (Protocol)                │
+           │   profile, facts, skills,             put/get/delete documents          │
+           │   documents meta, applications,       (resumes, letters, samples)       │
+           │   events, style profiles                                                 │
+           │      └─ SQLitePersonalStore (M1)      └─ LocalBlobStore (M1)            │
+           │      └─ future: encrypted / remote backends (not selected, A2)          │
+           └─────────────────────────────────────────────────────────────────────────┘
+```
+
+- Every table is classified as `personal` or `operational` (§10.0). Personal tables are accessed only through `PersonalDataStore`, so a different backend (e.g., an encrypted file, or a storage service you approve later) can replace it without touching the workers.
+- Default `data_dir` is `$CAREEROS_DATA_DIR` or `~/.local/share/careeros/<dataset_kind>`. It is always outside the repository.
+- The database records its `dataset_kind` in `meta`. Synthetic and personal data never share one database, and `careeros init --synthetic` refuses to seed into a personal database.
+
+### 9.3 Persistence across sessions — current limit
+
+Task state persists in SQLite under `data_dir`. That survives the end of a process or execution
+session, so interrupted objectives resume (A7). **A cloud container's disk is reclaimed after
+inactivity**, so personal data and task state in this cloud environment are not durable across
+containers. Committing snapshots to GitHub is ruled out (A2). Until you choose a secure
+persistent store, the options are:
+
+1. Accept that cloud-session data is temporary (fine for synthetic development, M0–M5);
+2. Export an **encrypted** snapshot (`careeros snapshot --encrypt`, future) and keep the file yourself, outside GitHub;
+3. Later, pick a storage backend for `PersonalDataStore` (decision deferred; nothing paid is selected).
 
 ---
 
@@ -450,7 +502,24 @@ only non-sensitive data, or keep the profile outside git and upload it each sess
 
 Conventions: `INTEGER PRIMARY KEY`, ISO-8601 UTC text timestamps, JSON columns stored as TEXT
 with `CHECK(json_valid(...))`, foreign keys ON, WAL mode. Migrations are numbered `.sql` files
-applied by a small migration runner.
+applied by a small migration runner. The authoritative schema is
+`src/careeros/core/migrations/0001_init.sql`. The listing below is a summary and may omit
+CHECK constraints.
+
+### 10.0 Data classification and metadata
+
+| Classification | Tables |
+|---|---|
+| `personal` | candidate_profile, work_authorization, profile_facts, skills, documents, style_profiles, applications, application_events |
+| `operational` (may still reference personal data by id) | companies, company_research, job_sources, jobs, job_analysis, eligibility_assessments, match_scores, objectives, plans, tasks, task_dependencies, task_results, task_checkpoints, reviews, manager_decisions, execution_sessions, model_profiles, model_calls, budgets, cache_entries, routing_stats, approvals |
+
+```sql
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- dataset_kind, created_at
+CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);
+```
+
+Task inputs and outputs can contain personal content, so the whole database is treated as
+personal for storage purposes (§9).
 
 ### 10.1 Profile
 
@@ -458,10 +527,19 @@ applied by a small migration runner.
 CREATE TABLE candidate_profile (
   id INTEGER PRIMARY KEY, version INTEGER NOT NULL,
   full_name TEXT, email TEXT, phone TEXT, location TEXT, links TEXT,         -- links JSON
-  citizenship TEXT, work_authorization TEXT,                                -- JSON per country
-  education_level TEXT, graduation_date TEXT,
+  education_level TEXT, graduation_date TEXT,          -- NULL = unknown
   preferences TEXT,                -- JSON: roles, locations, remote, terms, min match score
   updated_at TEXT NOT NULL);
+
+-- A3: no defaults that assume status. Absent row or 'unknown' => needs confirmation.
+CREATE TABLE work_authorization (
+  id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL REFERENCES candidate_profile(id),
+  country TEXT NOT NULL,                 -- ISO 3166-1 alpha-2
+  status TEXT NOT NULL DEFAULT 'unknown' CHECK(status IN
+    ('unknown','citizen','permanent_resident','authorized','requires_sponsorship','not_authorized')),
+  details TEXT,                          -- free-text note, e.g. permit type (user-entered only)
+  confirmed_by_user INTEGER NOT NULL DEFAULT 0, confirmed_at TEXT,
+  UNIQUE(profile_id, country));
 
 CREATE TABLE profile_facts (       -- atomic, citable facts
   id INTEGER PRIMARY KEY,
@@ -539,8 +617,9 @@ CREATE TABLE job_analysis (
 CREATE TABLE eligibility_assessments (
   id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
   profile_version INTEGER NOT NULL,
-  verdict TEXT NOT NULL CHECK(verdict IN ('eligible','ineligible','uncertain')),
-  reasons TEXT, blocking_criteria TEXT, confidence REAL,
+  verdict TEXT NOT NULL CHECK(verdict IN
+    ('eligible','ineligible','needs_user_confirmation','uncertain')),
+  reasons TEXT, blocking_criteria TEXT, unknown_inputs TEXT, confidence REAL,
   task_id INTEGER REFERENCES tasks(id), assessed_at TEXT NOT NULL,
   UNIQUE(job_id, profile_version));
 
@@ -624,6 +703,15 @@ CREATE TABLE task_results (
   confidence REAL, effective_confidence REAL,
   unresolved_questions TEXT, recommended_next_steps TEXT,
   created_at TEXT NOT NULL);
+
+CREATE TABLE task_checkpoints (   -- A7: resume multi-step workers mid-way
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
+  attempt INTEGER NOT NULL, step TEXT NOT NULL, state TEXT NOT NULL,
+  created_at TEXT NOT NULL, UNIQUE(task_id, attempt, step));
+
+CREATE TABLE execution_sessions (  -- one row per manager/scheduler invocation
+  id TEXT PRIMARY KEY, started_at TEXT NOT NULL, last_heartbeat_at TEXT,
+  ended_at TEXT, end_reason TEXT, host TEXT);
 
 CREATE TABLE reviews (
   id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
@@ -711,12 +799,13 @@ GROUP BY t.task_type;
 CareerOS/
 ├── pyproject.toml                 # Python 3.12; deps: pydantic, typer, httpx, jinja2, pyyaml, rapidfuzz
 ├── README.md
-├── .gitignore                     # data/, .env, var/, caches
+├── .gitignore                     # data/, personal/, *.db, .env, var/, caches
+├── .github/workflows/ci.yml       # lint + type-check + tests (free GitHub Actions allowance)
 ├── docs/
 │   ├── ARCHITECTURE.md            # this document
 │   └── decisions/                 # short ADRs (one per significant choice)
 ├── config/
-│   ├── careeros.example.yaml      # execution mode (mock), concurrency, limits, budgets
+│   ├── careeros.example.yaml      # execution mode (mock), storage, concurrency, limits, budgets, eligibility rules
 │   ├── models.yaml                # capability profiles; mock enabled, real disabled templates
 │   ├── routing.yaml               # task types, base complexity, quality floors, priors, ladders
 │   └── playbooks/                 # objective → task-DAG templates
@@ -724,9 +813,10 @@ CareerOS/
 │       ├── prepare_application.yaml
 │       └── weekly_review.yaml
 ├── src/careeros/
-│   ├── core/                      # config loading, db + migration runner, ids, clock, errors, logging
+│   ├── core/                      # config loading, db + migration runner, clock, errors
 │   │   └── migrations/0001_init.sql ...
-│   ├── domain/                    # pydantic models + repositories: profile, jobs, companies, applications
+│   ├── storage/                   # data-dir resolution, PersonalDataStore, BlobStore, SQLite/local impls
+│   ├── domain/                    # pydantic models + repositories: profile, jobs, companies, applications, orchestration
 │   ├── llm/
 │   │   ├── base.py                # ModelRequest/Response, Effort, ModelAdapter protocol
 │   │   ├── gateway.py             # safety → budget → cache → adapter → ledger
@@ -748,17 +838,16 @@ CareerOS/
 │   ├── documents/                 # render.py, templates/ (Markdown/HTML; PDF later)
 │   ├── prompts/                   # versioned Jinja templates, one per task_type
 │   └── cli/                       # `careeros` Typer app
-├── workspace/                     # YOUR source-of-truth data (see §9 decision)
-│   ├── profile/  writing_samples/  snapshots/
 ├── tests/
 │   ├── unit/  integration/  simulation/
-│   └── fixtures/                  # sample profile, sample jobs, scripted model responses
-├── data/                          # gitignored: careeros.db, generated documents, page cache
-└── var/                           # gitignored: manual-bridge inbox/outbox, logs
+│   └── fixtures/                  # SYNTHETIC profile and jobs only; scripted model responses (M2+)
+└── (no personal data in the repo — it lives in data_dir outside the working tree, §9)
 ```
 
-Tooling (all free): `pytest`, `ruff`, `mypy`. GitHub Actions CI is optional. Private repos get a
-free monthly minutes quota, but I will only add it if you approve.
+Tooling (all free): `pytest`, `ruff`, `mypy`. GitHub Actions runs the same checks on push and
+pull request (A6). One Linux job, one Python version, a short timeout and concurrency
+cancellation keep usage well inside the free private-repo allowance. The identical command
+(`make check` or the commands in the README) runs in a session.
 
 ---
 
@@ -788,25 +877,27 @@ one starts. All milestones through M9 run entirely on mock, scripted or manual a
 
 | # | Milestone | Deliverables | Done when |
 |---|---|---|---|
-| **M0** | Scaffold | pyproject, package layout, ruff/mypy/pytest, `.gitignore`, README, ADR template | `pytest` and `ruff` pass on an empty skeleton |
-| **M1** | Core and data | Config loader, SQLite + migration runner, full schema (§10), domain models and repositories, `careeros init/status` | Schema created; repository round-trip tests pass |
+| **M0** | Scaffold | pyproject, package layout, ruff/mypy/pytest, `.gitignore` with personal-data patterns, README, ADR template, GitHub Actions CI | `pytest`, `ruff` and `mypy` pass locally; CI workflow is valid |
+| **M1** | Core and data | Typed config loader (models/routing/eligibility config templates, mock-only), storage abstraction (§9.2), SQLite + migration runner, full schema (§10), domain models and repositories, synthetic fixtures, `careeros init/status/config` | Schema created; repository round-trip tests pass; data dir can't be inside the repo; unknown work authorization is the default; task state survives closing and reopening the database |
 | **M2** | Model layer and cost | Adapter protocol, `mock` and `scripted` adapters (fault injection), registry, token estimation, gateway, ledger, hierarchical budgets with reservations, cache + single-flight, **safety gate** | Tests prove: no real call possible by default; budget stops calls; cache prevents duplicates; simulated cost is recorded |
 | **M3** | Orchestration engine | State machine, DAG, scheduler with bounded parallelism, leases + crash recovery, idempotency, `WorkerResult` validation, review-task insertion | Tests: parallel independent tasks; dependency order; kill mid-run → `resume` completes without redoing work |
-| **M4** | Manager and router | Playbooks, planner, complexity estimator, quality-adjusted routing, escalation ladder, decision table, replanning, definition-of-done checking, `routing_stats` learning, `manual_bridge` adapter, **simulation harness** | Simulated scenarios (easy / hard / flaky / over-budget / ineligible) produce the expected routes, escalations, stops and cost reports |
+| **M4** | Manager and router | Playbooks, planner, complexity estimator, quality-adjusted routing, escalation ladder, decision table, replanning, definition-of-done checking, `routing_stats` learning, **simulation harness** (optional manual bridge may follow, A5) | Simulated scenarios (easy / hard / flaky / over-budget / ineligible) produce the expected routes, escalations, stops and cost reports |
 | **M5** | Profile | Import profile from YAML/Markdown into `profile_facts`; writing samples; stylometric style profile; `careeros profile show/validate` | Your real profile loads; facts are citable; style vector is computed |
-| **M6** | Discovery and eligibility | Greenhouse/Lever/Ashby public board clients + RSS + manual URL/paste import; normalize, dedupe, filter; job analysis; eligibility rules | Fixture-based tests pass; live fetch **only after** a network-allowlist approval for those hosts |
+| **M6** | Discovery and eligibility | **First: ADR verifying each source's current endpoints, rate limits and terms (A4).** Then Greenhouse/Lever/Ashby public board clients + manual URL/paste import; normalize, dedupe, filter; job analysis; configurable eligibility rules with `needs_user_confirmation` | Fixture-based tests pass; live fetch only after the ADR and the environment network allowlist are approved. No LinkedIn or Indeed scraping |
 | **M7** | Research and matching | Bounded employer research with caching and freshness; TF-IDF/rule matching; shortlist report | Repeated research on the same company costs $0; ranked shortlist produced |
 | **M8** | Documents and quality | Resume tailoring, cover letters, application answers, truthfulness checker, rubric reviewer, style scoring, document rendering | Golden tests: 0 unsupported claims; style distance reported; drafts produced via mock or manual bridge |
-| **M9** | Tracking and reporting | Application lifecycle + events, deadlines, outcome analytics, cost/quality dashboard (static HTML/CLI), `snapshot/restore` | End-to-end mock run from discovery → package → tracked application |
+| **M9** | Tracking and reporting | Application lifecycle + events, deadlines, outcome analytics, cost/quality dashboard (static HTML/CLI), encrypted local `snapshot/restore` (never committed, A2) | End-to-end mock run from discovery → package → tracked application |
 | **M10** | Real providers (**only with explicit approval**) | Implement chosen adapter(s), verified pricing, approval record, small budget, kill switch, contract tests vs mock | Not started unless you authorize a provider, a budget cap and an expiry in writing |
 
 ---
 
-## 14. Decisions needed from you
+## 14. Outstanding decisions
 
-1. **Approve this plan** as written, or list changes.
-2. **Personal data in the private repo** (§9): commit `workspace/` (profile and snapshots) to the private repo, commit only non-sensitive parts, or upload each session?
-3. **Work authorization and graduation details** (needed for eligibility rules in M5/M6): citizenship and permits for Canada/US, degree and expected graduation date, and target terms (e.g., Summer 2027, 8–16-month co-ops).
-4. **Network access for job sources (M6):** OK to request an environment allowlist for the free public ATS endpoints (Greenhouse, Lever, Ashby job-board APIs) when we get there? LinkedIn/Indeed scraping is excluded because of their terms of service.
-5. **Manual-bridge adapter:** useful to you (paste prompts into an AI tool you already use and paste responses back), or skip it?
-6. **CI:** add GitHub Actions within the free private-repo quota, or run tests only in the session?
+Resolved: plan approval (A1), personal data in git (A2: no), eligibility (A3), job sources (A4),
+manual bridge (A5: optional), CI (A6: GitHub Actions within the free allowance).
+
+Still open (none blocks M0/M1):
+
+1. **Durable personal storage** (§9.3): how real profile data and task state should persist across cloud containers. Deferred; nothing selected.
+2. **Your eligibility inputs**: enter them yourself later through the CLI (M5). Until then every authorization is `unknown`.
+3. **Network allowlist for job-board hosts**: to be requested at M6 after the terms review.

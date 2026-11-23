@@ -1,0 +1,55 @@
+# CareerOS configuration template (committed). Copy to careeros.yaml for local overrides;
+# careeros.yaml is gitignored. Never put secrets or personal details in either file.
+
+execution:
+  mode: mock               # mock | scripted. 'real' and 'manual' are rejected until approved.
+  allow_real_models: false
+  max_concurrency: 4
+
+storage:
+  # Leave unset to use ~/.local/share/careeros/<dataset_kind>. Must be outside any git repo.
+  data_dir: null
+  dataset_kind: synthetic  # synthetic | personal
+  backend: sqlite
+
+budgets:
+  real_monthly_usd: 0.0    # must stay 0.0 until real spending is explicitly approved
+  simulated_monthly_usd: 5.0
+  default_objective_usd: 0.50
+  default_task_usd: 0.10
+
+limits:
+  max_attempts: 3
+  max_escalations: 2
+  max_retries_transient: 2
+  max_tasks_per_objective: 100
+  task_timeout_seconds: 300
+  lease_seconds: 120
+  research:
+    max_sources: 5
+    max_depth: 2
+    max_queries: 8
+    max_tokens_per_company: 20000
+
+eligibility:
+  # Where to SEARCH. These are not statements about the candidate's status.
+  target_countries: [CA, US]
+  include_remote_international: true
+  # Every rule resolves an unknown candidate input to needs_user_confirmation.
+  # No citizenship, residency or work authorization is assumed.
+  rules:
+    - id: work_authorization
+      description: Candidate's work authorization for the job's country satisfies the posting.
+      requirement: work_authorization
+    - id: graduation_window
+      description: Expected graduation date falls in the posting's required window.
+      requirement: graduation_window
+    - id: degree_level
+      description: Current degree level matches the posting.
+      requirement: degree_level
+    - id: location
+      description: Job location or remote policy is compatible with the candidate's preferences.
+      requirement: location
+    - id: term
+      description: Internship term matches the candidate's availability.
+      requirement: term

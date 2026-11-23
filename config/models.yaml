@@ -1,0 +1,40 @@
+# Provider-neutral model capability profiles.
+# Only offline mock profiles are enabled. Prices are SIMULATED placeholders used to test
+# cost logic; they are not claims about any vendor's prices.
+# A real provider may appear here only as a disabled template, and stays disabled until
+# real execution is explicitly approved (milestone M10) and its pricing is verified.
+
+models:
+  - id: mock-large
+    provider: mock
+    tier: 1
+    capabilities: [reasoning, long_context, json]
+    context_window: 200000
+    effort_levels: [low, medium, high, max]
+    pricing: {input_per_mtok: 15.0, output_per_mtok: 75.0, simulated: true}
+    enabled: true
+
+  - id: mock-medium
+    provider: mock
+    tier: 2
+    capabilities: [reasoning, json]
+    context_window: 128000
+    effort_levels: [none, low, medium, high]
+    pricing: {input_per_mtok: 3.0, output_per_mtok: 15.0, simulated: true}
+    enabled: true
+
+  - id: mock-small
+    provider: mock
+    tier: 3
+    capabilities: [json, classification, extraction]
+    context_window: 32000
+    effort_levels: [none]
+    pricing: {input_per_mtok: 0.25, output_per_mtok: 1.25, simulated: true}
+    enabled: true
+
+  # Disabled template (example shape only):
+  # - id: <provider-model-id>
+  #   provider: <provider-name>
+  #   tier: 2
+  #   pricing: {input_per_mtok: null, output_per_mtok: null, simulated: false, verified_at: null}
+  #   enabled: false
