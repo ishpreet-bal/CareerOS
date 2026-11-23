@@ -77,6 +77,9 @@ class BudgetConfig(_Strict):
     default_task_usd: float = Field(default=0.25, ge=0)
     #: Cap on simulated spend by one execution session (one `run`/`resume` invocation).
     session_simulated_usd: float = Field(default=2.0, ge=0)
+    #: Input-token estimates are multiplied by this when reserving, to cover tokenizer
+    #: differences (estimates are ~4 chars/token; real tokenizers vary).
+    input_token_margin: float = Field(default=1.10, ge=1.0, le=3.0)
 
     @field_validator("real_monthly_usd")
     @classmethod
@@ -259,6 +262,9 @@ class RoutingConfig(_Strict):
     absolute_min_quality: float = Field(default=0.5, ge=0, le=1)
     #: Effective confidence below this is treated as a low-confidence result.
     confidence_threshold: float = Field(default=0.7, ge=0, le=1)
+    #: Hard output cap per call = expected output tokens x effort multiplier x this factor.
+    #: The cap is sent to the provider and the worst case at the cap is what gets reserved.
+    output_cap_factor: float = Field(default=1.5, ge=1.0, le=10.0)
     #: Minimum reviewer score to accept an important deliverable.
     review_accept_score: float = Field(default=0.75, ge=0, le=1)
     task_types: dict[str, TaskTypePolicy] = Field(default_factory=dict)

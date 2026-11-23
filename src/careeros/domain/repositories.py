@@ -378,6 +378,109 @@ class OrchestrationRepository:
             )
         return plan.model_copy(update={"id": cur.lastrowid, "version": version})
 
+    def skip_steps(
+        self, objective_id: int, task_ids: dict[int, str], *, rationale: str, reason: str
+    ) -> tuple[Plan, list[str]]:
+        """Replan by skipping steps, atomically (audit M2).
+
+        In one write transaction: mark the tasks skipped (only if they have not started or
+        finished), and create the next plan version whose ``skipped`` list is the *union* of
+        the previous list and the new steps. Concurrent prunes serialize on the write lock,
+        so no update is lost and a skipped step can never become required again.
+        """
+        now = utc_now_iso()
+        with self.db.transaction() as c:
+            cur_plan = c.execute(
+                "SELECT * FROM plans WHERE objective_id=? AND superseded_at IS NULL",
+                (objective_id,),
+            ).fetchone()
+            if cur_plan is None:
+                raise NotFoundError(f"Objective {objective_id} has no current plan")
+            graph = from_json(cur_plan["graph"], {})
+            before = set(graph.get("skipped", []))
+            newly: list[str] = []
+            for tid, step in sorted(task_ids.items()):
+                changed = c.execute(
+                    "UPDATE tasks SET status='skipped', last_error=?, updated_at=?,"
+                    " finished_at=? WHERE id=? AND status IN"
+                    " ('pending','ready','retry_scheduled','blocked_budget','awaiting_human')",
+                    (f"pruned: {reason}"[:300], now, now, tid),
+                ).rowcount
+                if changed or step not in before:
+                    newly.append(step)
+            graph["skipped"] = sorted(before | set(task_ids.values()))
+            row = c.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM plans WHERE objective_id=?",
+                (objective_id,),
+            ).fetchone()
+            version = int(row["v"]) + 1
+            c.execute(
+                "UPDATE plans SET superseded_at=? WHERE objective_id=? AND superseded_at IS NULL",
+                (now, objective_id),
+            )
+            ins = c.execute(
+                "INSERT INTO plans (objective_id, version, source, rationale, graph, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (objective_id, version, cur_plan["source"], rationale, to_json(graph), now),
+            )
+        plan = Plan(
+            id=ins.lastrowid,
+            objective_id=objective_id,
+            version=version,
+            source=cur_plan["source"],
+            rationale=rationale,
+            graph=graph,
+        )
+        return plan, sorted(set(newly))
+
+    def finish_objective(
+        self, objective_id: int, status: ObjectiveStatus, reason: str
+    ) -> tuple[int, int]:
+        """Finish an objective consistently, in one transaction (audit M3).
+
+        Cancels every task that has not finished (including tasks blocked on budget or
+        awaiting the user), withdraws every pending approval request, sets the objective's
+        final status and records the stop decision. Returns (tasks cancelled, requests
+        withdrawn).
+        """
+        now = utc_now_iso()
+        with self.db.transaction() as c:
+            cancelled = c.execute(
+                "UPDATE tasks SET status='cancelled', last_error=?, lease_owner=NULL,"
+                " lease_expires_at=NULL, updated_at=?, finished_at=? WHERE objective_id=?"
+                " AND status NOT IN ('succeeded','failed','cancelled','skipped')",
+                ("not needed: objective finished", now, now, objective_id),
+            ).rowcount
+            withdrawn = c.execute(
+                "UPDATE approval_requests SET status='withdrawn', resolution=?, resolved_at=?"
+                " WHERE objective_id=? AND status='pending'",
+                (f"objective {status.value}: {reason}"[:300], now, objective_id),
+            ).rowcount
+            c.execute(
+                "UPDATE objectives SET status=?, stop_reason=?, updated_at=?,"
+                " completed_at=COALESCE(completed_at, ?) WHERE id=?",
+                (status.value, reason, now, now, objective_id),
+            )
+            c.execute(
+                "INSERT INTO manager_decisions (objective_id, task_id, decision, rationale,"
+                " inputs, created_at) VALUES (?,?,?,?,?,?)",
+                (
+                    objective_id,
+                    None,
+                    "stop",
+                    reason,
+                    to_json(
+                        {
+                            "status": status.value,
+                            "tasks_cancelled": cancelled,
+                            "requests_withdrawn": withdrawn,
+                        }
+                    ),
+                    now,
+                ),
+            )
+        return cancelled, withdrawn
+
     def current_plan(self, objective_id: int) -> Plan | None:
         r = self.db.query_one(
             "SELECT * FROM plans WHERE objective_id=? AND superseded_at IS NULL", (objective_id,)

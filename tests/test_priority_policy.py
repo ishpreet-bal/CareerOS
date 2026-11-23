@@ -84,7 +84,7 @@ def test_high_priority_asks_and_user_approved_downgrade_is_recorded(ctx: AppCont
     resolution = ctx.db.query_one(
         "SELECT resolution FROM approval_requests WHERE id=?", (req["id"],)
     )["resolution"]
-    assert resolution == "accept_downgrade"
+    assert resolution == "accept_downgrade:task"  # tied to the route that asked
 
 
 def test_critical_priority_also_asks(ctx: AppContext) -> None:

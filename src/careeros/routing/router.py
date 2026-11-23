@@ -25,7 +25,12 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, cast
 
 from careeros.core.config import EFFORT_ORDER, AppConfig, Effort, ModelProfile, Priority
-from careeros.cost.pricing import call_cost_usd
+from careeros.cost.pricing import (
+    call_cost_usd,
+    expected_output_tokens,
+    output_cap_tokens,
+    reservation_usd,
+)
 from careeros.routing.complexity import ComplexityEstimate
 from careeros.routing.stats import RoutingStatsRepository
 
@@ -39,8 +44,10 @@ class Candidate:
     tier: int
     effort: Effort
     p_accept: float
-    est_cost_usd: float
+    est_cost_usd: float  # expected cost of one call (drives the choice)
     expected_cost_usd: float = 0.0
+    #: Worst-case cost at the output cap: what the gateway reserves (drives affordability).
+    reserve_usd: float = 0.0
     history_attempts: int = 0
     meets_floor: bool = False
     within_budget: bool = False
@@ -99,9 +106,19 @@ class Router:
         self, profile: ModelProfile, task_type: str, effort: Effort, input_tokens: int | None
     ) -> float:
         policy = self.config.routing.policy(task_type)
-        mult = self.config.routing.effort_output_multiplier.get(effort, 1.0)
         in_tok = input_tokens if input_tokens is not None else policy.expected_input_tokens
-        return call_cost_usd(profile, in_tok, round(policy.expected_output_tokens * mult))
+        return call_cost_usd(
+            profile, in_tok, expected_output_tokens(self.config, task_type, effort)
+        )
+
+    def reserve_cost(
+        self, profile: ModelProfile, task_type: str, effort: Effort, input_tokens: int | None
+    ) -> float:
+        """Must match what the gateway will reserve for this call."""
+        policy = self.config.routing.policy(task_type)
+        in_tok = input_tokens if input_tokens is not None else policy.expected_input_tokens
+        cap = output_cap_tokens(self.config, task_type, effort)
+        return reservation_usd(self.config, profile, in_tok, cap)
 
     # ---------------------------------------------------------------- candidates
     def _efforts(self, profile: ModelProfile, default: Effort) -> list[Effort]:
@@ -154,6 +171,7 @@ class Router:
                         p,
                         self.est_cost(m, task_type, e, input_tokens),
                         history_attempts=n,
+                        reserve_usd=self.reserve_cost(m, task_type, e, input_tokens),
                     )
                 )
         return _with_expected_costs(out)
@@ -206,7 +224,7 @@ class Router:
                 **{
                     **asdict(c),
                     "meets_floor": c.p_accept >= floor,
-                    "within_budget": c.est_cost_usd <= budget_available_usd + 1e-12,
+                    "within_budget": c.reserve_usd <= budget_available_usd + 1e-12,
                 }
             )
             for c in cands
@@ -242,37 +260,39 @@ class Router:
         def strongest(pool: list[Candidate]) -> Candidate:
             return max(pool, key=lambda c: (c.p_accept, -c.est_cost_usd))
 
-        feasible = [c for c in cands if c.meets_floor and c.within_budget]
+        # Audit H1: the hard minimum applies to every choice, whatever routing history says.
+        hard_min = max(rc.absolute_min_quality, rc.policy(task_type).min_quality)
+        eligible = [c for c in cands if c.p_accept >= hard_min - 1e-12]
+        feasible = [c for c in eligible if c.meets_floor and c.within_budget]
         if feasible:
             return decision(
                 "routed",
                 best(feasible),
                 "Lowest expected cost to an accepted result that meets the floor.",
+                hard_min=hard_min,
             )
 
-        meeting = [c for c in cands if c.meets_floor]
-        affordable = [c for c in cands if c.within_budget]
-        if not meeting:
-            # No model is expected to meet the floor at all: a capability limit, not a budget
-            # trade-off. Use the strongest affordable option; review decides acceptance.
-            if affordable:
-                return decision(
-                    "routed",
-                    strongest(affordable),
-                    "No option is expected to meet the floor; using the strongest "
-                    "affordable option. Review decides acceptance.",
-                )
+        if not eligible:
+            # Not even the strongest option is expected to reach the hard minimum: there is
+            # nothing acceptable to run. Never route below the minimum; ask the user.
+            top = strongest(cands)
             return decision(
-                "needs_approval",
+                "no_candidate",
                 None,
-                "No affordable option for this task. Approval required.",
-                needed_usd=min(c.est_cost_usd for c in cands),
-                downgrade_option=None,
+                f"No option reaches the hard minimum quality {hard_min:.2f} for {task_type} "
+                f"(best p={top.p_accept:.2f}). Needs your decision.",
+                hard_min=hard_min,
+                best_p=top.p_accept,
             )
 
-        # Quality is reachable, but not within the remaining budget.
-        needed = min(c.est_cost_usd for c in meeting)
-        hard_min = max(rc.absolute_min_quality, rc.policy(task_type).min_quality)
+        # The floor cannot be met within budget. What would meeting it (or, if no option can
+        # meet it at all, getting the best possible quality) cost?
+        meeting = [c for c in eligible if c.meets_floor]
+        target = min(meeting, key=lambda c: c.reserve_usd) if meeting else strongest(eligible)
+        needed = target.reserve_usd
+        affordable = [c for c in eligible if c.within_budget]
+        # Every option below the floor is a downgrade; it is only allowed (a) with the
+        # user's explicit approval or (b) automatically for priorities with a degrade limit.
         if approved_floor is not None:
             approved = [c for c in affordable if c.p_accept >= max(approved_floor, hard_min)]
             if approved:
@@ -284,6 +304,7 @@ class Router:
                     f"(chosen p={choice.p_accept:.2f}).",
                     needed_usd=needed,
                     approved_floor=approved_floor,
+                    hard_min=hard_min,
                 )
         if degrade_floor is not None:
             within = [c for c in affordable if c.p_accept >= degrade_floor]
@@ -296,23 +317,29 @@ class Router:
                     f"{floor:.2f}, chosen p={choice.p_accept:.2f} (limit {degrade_floor:.2f}).",
                     needed_usd=needed,
                     degrade_floor=degrade_floor,
+                    hard_min=hard_min,
                 )
-        option = [c for c in affordable if c.p_accept >= hard_min]
-        down = strongest(option) if option else None
+        down = strongest(affordable) if affordable else None
         why = (
             "never downgraded automatically"
             if degrade_floor is None
             else f"no affordable option within the downgrade limit ({degrade_floor:.2f})"
         )
+        what = (
+            f"Meeting the {priority} quality floor ({floor:.2f}) needs ~${needed:.4f}"
+            if meeting
+            else f"No option meets the {priority} floor ({floor:.2f}); the best option "
+            f"(p={target.p_accept:.2f}) needs ~${needed:.4f}"
+        )
         return decision(
             "needs_approval",
             None,
-            f"Meeting the {priority} quality floor ({floor:.2f}) needs ~${needed:.4f}; only "
-            f"${budget_available_usd:.4f} is available ({priority} priority: {why}). "
-            "Approve a budget increase"
+            f"{what}; only ${budget_available_usd:.4f} is available ({priority} priority: "
+            f"{why}). Approve a budget increase"
             + (f" or a downgrade to p={down.p_accept:.2f}." if down else "."),
             needed_usd=needed,
             downgrade_option=asdict(down) if down else None,
+            hard_min=hard_min,
         )
 
 

@@ -150,6 +150,11 @@ def build_report(db: Database, objective_id: int) -> CostReport:
             "planning_cost_usd": sum(c.cost_usd for c in calls if c.purpose == "planning"),
             "wasted_cost_usd": sum(t.wasted_usd for t in tasks),
             "estimated_cost_usd": est_total,
+            "reserved_usd": sum(
+                float(c["reserved_usd"] or 0.0) for c in crows if c["status"] != "cache_hit"
+            ),
+            "overshoot_usd": sum(float(c["overshoot_usd"] or 0.0) for c in crows),
+            "overshoot_calls": sum(1 for c in crows if (c["overshoot_usd"] or 0.0) > 0),
             "model_calls": len(calls),
             "cache_hits": sum(1 for c in calls if c.status == "cache_hit"),
             "abandoned_calls": sum(1 for c in calls if c.status == "abandoned"),
@@ -209,7 +214,10 @@ def format_report(rep: CostReport) -> str:
         "Totals (simulated USD):",
         f"  total {_usd(t['total_cost_usd'])} = tasks {_usd(t['task_cost_usd'])} + reviews "
         f"{_usd(t['review_cost_usd'])} + planning {_usd(t['planning_cost_usd'])}",
-        f"  estimated before calls {_usd(t['estimated_cost_usd'])}; budget {_usd(t['budget_usd'])}",
+        f"  estimated before calls {_usd(t['estimated_cost_usd'])}; worst case reserved "
+        f"{_usd(t['reserved_usd'])}; budget {_usd(t['budget_usd'])}",
+        f"  overshoot beyond reservations {_usd(t['overshoot_usd'])} "
+        f"({t['overshoot_calls']} call(s))",
         f"  spent on failed/rejected attempts {_usd(t['wasted_cost_usd'])}",
         f"  calls {t['model_calls']} (abandoned {t['abandoned_calls']}), cache hits "
         f"{t['cache_hits']}, retries {t['retries']}, "

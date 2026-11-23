@@ -33,6 +33,33 @@ def _submit(m: CareerManager, kind: str, **kw: Any) -> int:
     return m.submit(ObjectiveRequest(title=kind, kind=kind, inputs={"text": "synthetic"}, **kw))
 
 
+def _step_reservation(ctx: AppContext, step: dict[str, Any]) -> float:
+    """What the gateway will reserve for this step on its routed model (worst case)."""
+    from careeros.llm.tokens import estimate_tokens
+    from careeros.manager.plans import StepSpec
+    from careeros.routing.router import Router
+    from careeros.routing.stats import RoutingStatsRepository
+    from careeros.workers.base import StepContext
+    from careeros.workers.generic import ModelStepWorker
+
+    spec = StepSpec.model_validate(step)
+    req = ModelStepWorker().build_request(
+        StepContext(
+            step_id=spec.id,
+            task_type=spec.task_type,
+            title=spec.title or spec.task_type,
+            instructions=spec.instructions,
+            params={"text": "synthetic", **spec.params},
+            deps={},
+            output_schema=spec.output.to_schema(),
+        )
+    )
+    profile = next(m for m in ctx.config.models if m.id == "mock-medium")
+    return Router(ctx.config, RoutingStatsRepository(ctx.db)).reserve_cost(
+        profile, spec.task_type, "low", estimate_tokens((req.system or "") + req.prompt)
+    )
+
+
 def _statuses(ctx: AppContext, oid: int) -> dict[str, str]:
     return {t.step or "": t.status.value for t in ctx.orchestration.list_tasks(oid)}
 
@@ -227,7 +254,14 @@ def test_concurrent_tasks_never_exceed_the_objective_budget(ctx: AppContext) -> 
 
     # The first two calls stay in flight until a third task has hit the reservation limit.
     adapter = GatedAdapter(n=2, timeout=3.0, on_call=check_invariant, hold_until=contention_seen)
-    pb = book("tight", [model_step(f"m{i}") for i in range(4)], budget_usd=0.03, priority="normal")
+    # Budget for two (not three) concurrent worst-case reservations.
+    reserve = _step_reservation(ctx, model_step("m0"))
+    pb = book(
+        "tight",
+        [model_step(f"m{i}") for i in range(4)],
+        budget_usd=2.5 * reserve,
+        priority="normal",
+    )
     m = CareerManager(ctx, adapter=adapter, playbooks=PlaybookLibrary([pb]))
     oid = _submit(m, "tight")
     m.run(oid)
@@ -424,7 +458,9 @@ def test_call_in_flight_at_crash_is_abandoned_and_charged_conservatively(ctx: Ap
     resumed = CareerManager(ctx, playbooks=m.playbooks, clock=later(10))
     assert resumed.run(oid).status is ObjectiveStatus.DONE
     row = ctx.db.query_one("SELECT * FROM model_calls WHERE id=?", (stuck["id"],))
-    assert row["status"] == "abandoned" and row["cost_usd"] == pytest.approx(row["est_cost_usd"])
+    # Charged the full worst-case reservation (a capped reply), not the optimistic estimate.
+    assert row["status"] == "abandoned" and row["cost_usd"] == pytest.approx(row["reserved_usd"])
+    assert row["reserved_usd"] > row["est_cost_usd"]
     m1 = task_by_step(ctx, oid, "m1")
     statuses = [r["status"] for r in calls(ctx, task_id=m1["id"], purpose="task")]
     assert statuses == ["abandoned", "ok"]

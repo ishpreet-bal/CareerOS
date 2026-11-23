@@ -1,6 +1,6 @@
 # CareerOS — Architecture & Implementation Plan (v3)
 
-Status: **APPROVED (with amendments in §0).** M0–M3 implemented; M4+ await approval.
+Status: **APPROVED (with amendments in §0).** M0–M3 implemented, plus Phase A audit fixes (§17); M4+ await approval.
 Nothing is deployed, purchased or configured against a paid service.
 
 ---
@@ -22,6 +22,7 @@ These decisions override anything below that conflicts with them.
 | A9 | **Priority and downgrade policy (2026-11-23):** critical and high-priority tasks are never downgraded automatically; if the floor cannot be met within budget the user is asked. Normal and low may be downgraded automatically within configured limits (`degrade_limits`), never below the task type's minimum quality (`min_quality`, e.g. factual deliverables) or `absolute_min_quality`. Every downgrade, automatic or user-approved, is recorded. Low priority optimizes for cost within its floor. | §5.4, §16.1 |
 | A10 | **M3 bounded concurrency (2026-11-23):** dependency-aware concurrent execution with a configurable worker limit (default 3), atomic budget reservations, exclusive task claims, idempotent model calls, lease-based recovery with multiple active workers. All model calls remain simulated. | §7, §16 |
 | A11 | **Storage stays offline-first (2026-11-23):** no external database, cloud storage, deployment or paid service. Keep a portable storage interface and document the path to durable storage. Synthetic data only. | §9.4, ADR 0005 |
+| A12 | **Phase A audit fixes (2026-11-23):** the A9 policy is enforced in every routing branch, including when learned history puts every option below the floor; no choice is ever below the task type's hard minimum. Reservations use the worst case at a hard output cap sent to the provider; any overshoot is recorded. Replans append to the skipped list atomically. Finishing an objective cancels unneeded tasks and withdraws pending requests in one transaction; obsolete approvals are rejected. Every downgrade (task, review, planning) is a `degrade` decision; approvals apply only to the routing step that asked. Lowered config budget limits apply immediately. | §5.4, §6.3, §17, ADR 0006 |
 
 CareerOS is a standalone, local-first career intelligence and internship application agent.
 It shares no code, database, agents, infrastructure or modules with any other project. Ideas
@@ -311,10 +312,18 @@ If no candidate is feasible (amendment A9):
 | `low` | Optimizes for cost within its floor; automatic downgrade allowed to at most `degrade_limits.low` (default 0.20) below; otherwise ask. |
 | every task | Never below `max(absolute_min_quality, task_type.min_quality)`; factual deliverables carry their own minimum (e.g. `resume.tailor: 0.80`). |
 
-Every downgrade — automatic or user-approved — is a `degrade` decision in the history with the
-floor, the chosen option and whether the user approved it; approvals are also rows in
-`approvals` (`quality_downgrade`). Config validation rejects removing `critical` or `high`
-from `no_degrade_priorities`.
+Every downgrade — automatic or user-approved, for a task, its review or model-assisted
+planning — is a `degrade` decision in the history with the floor, the chosen option, the
+routing step (`purpose`) and whether the user approved it; approvals are also rows in
+`approvals` (`quality_downgrade`) and apply only to the routing step that requested them
+(a review approval never lowers the task's own floor). Config validation rejects removing
+`critical` or `high` from `no_degrade_priorities`.
+
+The same rules hold when **no option can meet the floor at all** (e.g. after learned history
+lowered every estimate): the best achievable option is treated as a downgrade — critical/high
+ask, normal/low only within their limit — and when not even the best option reaches the hard
+minimum, nothing runs and the user is asked (`no_candidate`). Learned history only changes
+the estimates; it can never bypass the policy (Phase A, audit H1).
 
 ### 5.5 Escalation ladder (bounded)
 
@@ -378,10 +387,19 @@ Reports (CLI and static HTML):
 
 ### 6.3 Budgets (hierarchical)
 
-`global (monthly) ⊇ objective ⊇ task`. Before a call, the gateway **reserves** the estimated
-cost at every level. After the call, it settles the reservation against the actual cost. If a
-reservation fails, the call is not made, and the manager decides (skip, defer or ask). In real
-mode the global budget defaults to **$0.00**, so real calls are impossible until you set one.
+`global (monthly) ⊇ session, objective ⊇ task`. Every call is sent with a **hard output cap**
+(`expected output × effort multiplier × output_cap_factor`), and the gateway **reserves the
+worst case** at every level: margin-adjusted input (`input_token_margin`) plus a full cap of
+output. After the call it settles the reservation against the actual cost; if the provider
+honours the cap, actual ≤ reserved, so no budget level can be exceeded, even with concurrent
+calls. If actual ever exceeds the reservation (a provider ignoring the cap, or an input
+estimate off by more than its margin), the excess is recorded as `model_calls.overshoot_usd`,
+shown in reports, and the overrun line refuses further calls. Routing decides affordability
+against the same worst-case figure. If a reservation fails, the call is not made, and the
+manager decides (requeue, ask or skip). Configuration that lowers the monthly or session
+limit applies to existing lines immediately; a raised limit applies to new lines (e.g. next
+month). In real mode the global budget defaults to **$0.00**, so real calls are impossible
+until you set one.
 
 ### 6.4 Limits
 
@@ -1120,4 +1138,39 @@ the model response, so completed work is neither repeated nor re-billed.
    scripts); the *interleaving* of the event log is not, and it does not need to be.
 6. **Session budgets** reset with each `run` invocation; the monthly simulated cap still
    bounds total spend.
+
+---
+
+## 17. Phase A — post-M3 audit fixes
+
+### 17.1 Fixed findings
+
+| Audit finding | Fix | Where |
+|---|---|---|
+| **H1** silent downgrade of critical/high work; choices below the factual minimum after learned history | Hard minimum applied to every candidate; "floor unreachable" handled by the same priority policy; `no_candidate` when nothing reaches the minimum; effort escalation falls back to tier escalation before asking | `routing/router.py` `Router.route`; `manager._route_for` |
+| **M1** settlement could exceed a budget | Hard output cap sent with every call; worst-case reservation; router affordability uses the same figure; overshoot recorded (`overshoot_usd`, error note, report) and the overrun line blocks further calls; abandoned calls charged the full reservation | `cost/pricing.py`, `llm/gateway.py`, `routing/router.py`, `cost/report.py` |
+| **M2** a second replan dropped earlier skipped steps | `skip_steps` marks tasks skipped and writes the next plan version with the union of skipped steps in one write transaction | `domain/repositories.py`, `manager._prune` |
+| **M3** inconsistent early completion; stale approvals reopened finished objectives | `finish_objective` cancels every unfinished task (incl. blocked/awaiting) and withdraws pending requests with the stop decision in one transaction; `approve`/`deny` validate the request, objective and task state, withdraw obsolete requests, and write atomically | `domain/repositories.py`, `manager._finish`, `manager.approve/deny` |
+| **M6** review/planning downgrades unrecorded; approvals applied to the wrong route | `_record_degrade` used by task, review and planning routing; requests carry `route_purpose`; review approvals set `tasks.approved_review_floor` | `manager.py` |
+| **M7** lowered monthly limit ignored until next month | Config-derived lines (month, session) are clamped to the lower configured limit | `cost/budget.py` `_ensure` |
+
+Migration `0004_phase_a_fixes.sql` adds `model_calls.reserved_usd/output_cap_tokens/
+overshoot_usd`, `tasks.approved_review_floor`, and the `withdrawn` request status.
+
+### 17.2 Still open (deliberately deferred)
+
+| Finding | Status |
+|---|---|
+| **H2** writes not fenced by lease ownership; late replies after takeover | Deferred to the ownership/recovery change (with M4, M5) |
+| **M4** heartbeat thread can die silently | Deferred (same change) |
+| **M5** multi-statement state transitions (`_block`, `_accept`, `_apply`, recovery) not atomic | Deferred (same change); `approve`, `deny`, `_finish` and `_prune` are now atomic |
+| L1–L12 (audit) | Unchanged except where noted above; see the audit report |
+
+### 17.3 New behaviour to be aware of
+
+* Reservations are larger than expected costs (worst case at the cap), so tight budgets ask
+  for approval earlier than before; demo budgets were re-sized accordingly.
+* A task whose best option falls below its hard minimum now stops and asks instead of
+  running; with poor learned history this can happen for factual task types.
+* Raising a config budget limit does not raise an existing month's line.
 

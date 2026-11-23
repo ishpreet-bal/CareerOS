@@ -61,12 +61,28 @@ class BudgetManager:
         self.config = config
 
     # ---------------------------------------------------------------- setup
-    def _ensure(self, scope: str, scope_ref: str, limit: float, period: str = "") -> int:
+    def _ensure(
+        self, scope: str, scope_ref: str, limit: float, period: str = "", *, clamp: bool = False
+    ) -> int:
+        """Return the budget line, creating it if needed.
+
+        ``clamp`` (config-derived levels: month, session): if configuration now specifies a
+        lower limit than the stored one, the lower limit applies immediately (audit M7).
+        A raised configuration limit never raises an existing line; it applies to new lines
+        (e.g. next month).
+        """
         row = self.db.query_one(
-            "SELECT id FROM budgets WHERE scope=? AND scope_ref=? AND period=? AND mode=?",
+            "SELECT id, limit_usd FROM budgets WHERE scope=? AND scope_ref=? AND period=?"
+            " AND mode=?",
             (scope, scope_ref, period, MODE),
         )
         if row is not None:
+            if clamp and limit < row["limit_usd"] - 1e-12:
+                with self.db.transaction() as c:
+                    c.execute(
+                        "UPDATE budgets SET limit_usd = MIN(limit_usd, ?) WHERE id=?",
+                        (limit, row["id"]),
+                    )
             return int(row["id"])
         with self.db.transaction() as c:
             c.execute(
@@ -91,7 +107,11 @@ class BudgetManager:
         b = self.config.budgets
         ids = [
             self._ensure(
-                "global_month", "all", b.simulated_monthly_usd, utc_now().strftime("%Y-%m")
+                "global_month",
+                "all",
+                b.simulated_monthly_usd,
+                utc_now().strftime("%Y-%m"),
+                clamp=True,
             ),
             self._ensure(
                 "objective",
@@ -100,7 +120,7 @@ class BudgetManager:
             ),
         ]
         if session_id is not None:
-            ids.append(self._ensure("session", session_id, b.session_simulated_usd))
+            ids.append(self._ensure("session", session_id, b.session_simulated_usd, clamp=True))
         if task_id is not None:
             t = self.db.query_one("SELECT budget_usd FROM tasks WHERE id=?", (task_id,))
             if t is None:
@@ -234,8 +254,11 @@ class BudgetManager:
 
     def raise_limit(self, scope: str, scope_ref: str, extra_usd: float) -> None:
         with self.db.transaction() as c:
-            c.execute(
-                "UPDATE budgets SET limit_usd = limit_usd + ? WHERE scope=? AND scope_ref=?"
-                " AND mode=?",
-                (extra_usd, scope, scope_ref, MODE),
-            )
+            self.raise_limit_in(c, scope, scope_ref, extra_usd)
+
+    @staticmethod
+    def raise_limit_in(c: sqlite3.Connection, scope: str, scope_ref: str, extra_usd: float) -> None:
+        c.execute(
+            "UPDATE budgets SET limit_usd = limit_usd + ? WHERE scope=? AND scope_ref=? AND mode=?",
+            (extra_usd, scope, scope_ref, MODE),
+        )

@@ -13,7 +13,7 @@ Every call, including failures, cache hits and abandoned calls, is recorded.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from careeros.cache.store import CacheStore, cache_key
@@ -22,7 +22,12 @@ from careeros.core.config import AppConfig, ModelProfile
 from careeros.core.db import Database, to_json
 from careeros.core.errors import CareerOSError, NotFoundError, SessionTerminatedError
 from careeros.cost.budget import BudgetManager
-from careeros.cost.pricing import call_cost_usd
+from careeros.cost.pricing import (
+    call_cost_usd,
+    expected_output_tokens,
+    output_cap_tokens,
+    reservation_usd,
+)
 from careeros.llm.contracts import ModelError, ModelRequest, ModelResponse
 from careeros.llm.registry import AdapterRegistry
 from careeros.llm.safety import check_call_allowed
@@ -47,8 +52,10 @@ class CallContext:
 @dataclass(frozen=True)
 class CostEstimate:
     input_tokens: int
-    output_tokens: int
-    cost_usd: float
+    output_tokens: int  # expected
+    cost_usd: float  # expected
+    output_cap: int = 0  # hard limit sent to the provider
+    reserve_usd: float = 0.0  # worst case at the cap: what is reserved
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,8 @@ class CallOutcome:
     cost_usd: float
     cache_key: str
     error: str | None = None
+    #: Settled cost above the reservation (0 when the provider honoured the cap).
+    overshoot_usd: float = 0.0
 
     @property
     def ok(self) -> bool:
@@ -131,11 +140,21 @@ class ModelGateway:
 
     # ---------------------------------------------------------------- estimates
     def estimate(self, profile: ModelProfile, request: ModelRequest) -> CostEstimate:
-        policy = self.config.routing.policy(request.task_type)
         in_tok = estimate_tokens((request.system or "") + request.prompt)
-        mult = self.config.routing.effort_output_multiplier.get(request.effort, 1.0)
-        out_tok = min(request.max_output_tokens, round(policy.expected_output_tokens * mult))
-        return CostEstimate(in_tok, out_tok, call_cost_usd(profile, in_tok, out_tok))
+        out_tok = min(
+            request.max_output_tokens,
+            expected_output_tokens(self.config, request.task_type, request.effort),
+        )
+        cap = output_cap_tokens(
+            self.config, request.task_type, request.effort, request.max_output_tokens
+        )
+        return CostEstimate(
+            in_tok,
+            out_tok,
+            call_cost_usd(profile, in_tok, out_tok),
+            cap,
+            reservation_usd(self.config, profile, in_tok, cap),
+        )
 
     # ---------------------------------------------------------------- calls
     def call(self, model_id: str, request: ModelRequest, ctx: CallContext) -> CallOutcome:
@@ -159,10 +178,14 @@ class ModelGateway:
             return CallOutcome(call_id, profile.id, "cache_hit", payload, None, 0.0, 0.0, key)
 
         est = self.estimate(profile, request)
+        # The provider is always given a hard output cap; the worst case at that cap is
+        # what is reserved (audit M1), so settlement cannot exceed the reservation unless
+        # the provider ignores the cap or the input estimate is off by more than its margin.
+        request = replace(request, max_output_tokens=est.output_cap)
         lines = self.budgets.lines_for(ctx.objective_id, ctx.task_id, ctx.session_id)
         with self.db.transaction() as c:  # T1
             reservation = self.budgets.reserve_in(  # raises BudgetExceededError
-                c, lines, est.cost_usd, session_id=ctx.session_id, task_id=ctx.task_id
+                c, lines, est.reserve_usd, session_id=ctx.session_id, task_id=ctx.task_id
             )
             call_id = self._insert_in_flight(
                 c, profile, request, ctx, mode, key, est, reservation.id
@@ -197,6 +220,13 @@ class ModelGateway:
             status, error = "error", f"adapter failure: {type(exc).__name__}: {exc}"
 
         cost = call_cost_usd(profile, in_tok, out_tok)
+        overshoot = max(0.0, cost - est.reserve_usd)
+        if overshoot > 1e-12:
+            note = (
+                f"settled ${cost:.6f} exceeds reservation ${est.reserve_usd:.6f} "
+                f"(output {out_tok} tokens, cap {est.output_cap})"
+            )
+            error = f"{error}; {note}" if error else note
         stored = {
             "payload": result_payload,
             "simulation": response.simulation if response else {},
@@ -204,8 +234,18 @@ class ModelGateway:
         with self.db.transaction() as c:  # T2
             c.execute(
                 "UPDATE model_calls SET status=?, error=?, input_tokens=?, output_tokens=?,"
-                " cost_usd=?, latency_ms=?, response_json=? WHERE id=?",
-                (status, error, in_tok, out_tok, cost, latency, to_json(stored), call_id),
+                " cost_usd=?, latency_ms=?, response_json=?, overshoot_usd=? WHERE id=?",
+                (
+                    status,
+                    error,
+                    in_tok,
+                    out_tok,
+                    cost,
+                    latency,
+                    to_json(stored),
+                    overshoot if overshoot > 1e-12 else 0.0,
+                    call_id,
+                ),
             )
             self.budgets.settle_in(c, reservation.id, cost)
             if ctx.task_id is not None and cost:
@@ -213,7 +253,16 @@ class ModelGateway:
                     "UPDATE tasks SET spent_usd = spent_usd + ? WHERE id=?", (cost, ctx.task_id)
                 )
         return CallOutcome(
-            call_id, profile.id, status, result_payload, response, est.cost_usd, cost, key, error
+            call_id,
+            profile.id,
+            status,
+            result_payload,
+            response,
+            est.cost_usd,
+            cost,
+            key,
+            error,
+            overshoot if overshoot > 1e-12 else 0.0,
         )
 
     def _replay(self, idempotency_key: str) -> CallOutcome | None:
@@ -249,9 +298,9 @@ class ModelGateway:
     def abandon_in_flight(self, stale_sessions: list[str]) -> int:
         """Settle calls left 'in_flight' by dead sessions.
 
-        The provider may or may not have done (and billed) the work, so the estimated cost
-        is charged conservatively, and the call is marked 'abandoned' so the task can make
-        a fresh call.
+        The provider may or may not have done (and billed) the work, so the full worst-case
+        reservation (the cost of a capped reply) is charged conservatively, and the call is
+        marked 'abandoned' so the task can make a fresh call.
         """
         if not stale_sessions:
             return 0
@@ -261,7 +310,9 @@ class ModelGateway:
             tuple(stale_sessions),
         )
         for r in rows:
-            est = float(r["est_cost_usd"] or 0.0)
+            est = float(
+                r["reserved_usd"] if r["reserved_usd"] is not None else r["est_cost_usd"] or 0.0
+            )
             with self.db.transaction() as c:
                 c.execute(
                     "UPDATE model_calls SET status='abandoned', cost_usd=?, error=?,"
@@ -288,7 +339,7 @@ class ModelGateway:
         " provider, tier, effort, mode, template_id, template_version, est_input_tokens,"
         " est_output_tokens, input_tokens, output_tokens, cached_tokens, est_cost_usd,"
         " cost_usd, cost_is_simulated, latency_ms, status, error, cache_key, cache_hit,"
-        " reservation_id, response_json, created_at"
+        " reservation_id, response_json, reserved_usd, output_cap_tokens, created_at"
     )
 
     def _values(
@@ -334,6 +385,8 @@ class ModelGateway:
             int(cache_hit),
             reservation_id,
             response_json,
+            est.reserve_usd if est else None,
+            est.output_cap if est else None,
             utc_now_iso(),
         )
 

@@ -222,7 +222,7 @@ def test_critical_task_is_not_downgraded_to_fit_budget(ctx: AppContext) -> None:
 
 def test_approve_requires_positive_amount_and_pending_state(ctx: AppContext) -> None:
     m = manager(ctx)
-    oid = m.submit(ObjectiveRequest(**{**DEMO.__dict__, "budget_usd": 0.12}))
+    oid = m.submit(ObjectiveRequest(**{**DEMO.__dict__, "budget_usd": 0.15}))
     m.run(oid)
     [req] = m.pending_requests(oid)
     with pytest.raises(CareerOSError):
