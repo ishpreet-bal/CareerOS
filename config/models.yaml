@@ -1,26 +1,44 @@
 # Provider-neutral model capability profiles.
+#
 # Only offline mock profiles are enabled. Prices are SIMULATED placeholders used to test
-# cost logic; they are not claims about any vendor's prices.
-# A real provider may appear here only as a disabled template, and stays disabled until
-# real execution is explicitly approved (milestone M10) and its pricing is verified.
+# cost logic; they are not claims about any vendor's prices. `simulation` describes how
+# each mock behaves (capability, latency, failure rates) and is ignored by real adapters.
+#
+# Tiers: 1 = strongest/most expensive, 3 = cheapest. The router chooses among enabled
+# profiles by capability, expected quality and cost; nothing else in CareerOS refers to
+# a profile by name.
 
 models:
   - id: mock-large
     provider: mock
     tier: 1
-    capabilities: [reasoning, long_context, json]
+    capabilities: [reasoning, long_context, json, planning, review]
     context_window: 200000
     effort_levels: [low, medium, high, max]
     pricing: {input_per_mtok: 15.0, output_per_mtok: 75.0, simulated: true}
+    simulation:
+      skill: 0.90
+      base_latency_ms: 900
+      ms_per_output_token: 12
+      malformed_rate: 0.005
+      invalid_rate: 0.005
+      timeout_rate: 0.01
     enabled: true
 
   - id: mock-medium
     provider: mock
     tier: 2
-    capabilities: [reasoning, json]
+    capabilities: [reasoning, json, planning, review]
     context_window: 128000
     effort_levels: [none, low, medium, high]
     pricing: {input_per_mtok: 3.0, output_per_mtok: 15.0, simulated: true}
+    simulation:
+      skill: 0.68
+      base_latency_ms: 500
+      ms_per_output_token: 6
+      malformed_rate: 0.02
+      invalid_rate: 0.03
+      timeout_rate: 0.01
     enabled: true
 
   - id: mock-small
@@ -30,11 +48,27 @@ models:
     context_window: 32000
     effort_levels: [none]
     pricing: {input_per_mtok: 0.25, output_per_mtok: 1.25, simulated: true}
+    simulation:
+      skill: 0.42
+      base_latency_ms: 200
+      ms_per_output_token: 2
+      malformed_rate: 0.05
+      invalid_rate: 0.06
+      timeout_rate: 0.01
+      rate_limit_rate: 0.02
     enabled: true
 
-  # Disabled template (example shape only):
-  # - id: <provider-model-id>
-  #   provider: <provider-name>
-  #   tier: 2
-  #   pricing: {input_per_mtok: null, output_per_mtok: null, simulated: false, verified_at: null}
-  #   enabled: false
+# How a real provider would be added later (milestone M10, only with explicit approval).
+# Each real model is just another profile; the router, manager and workers do not change.
+# Anthropic's high, medium and low-cost model families would map to tiers 1, 2 and 3.
+# Model identifiers and prices must be copied from the provider's current documentation
+# at that time; none are assumed here.
+#
+#  - id: anthropic-tier1
+#    provider: anthropic
+#    provider_model: "<model id from provider docs>"
+#    tier: 1
+#    capabilities: [reasoning, long_context, json, planning, review]
+#    effort_levels: [low, medium, high, max]
+#    pricing: {input_per_mtok: null, output_per_mtok: null, simulated: false, verified_at: null}
+#    enabled: false

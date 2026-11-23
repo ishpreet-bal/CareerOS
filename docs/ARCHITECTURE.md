@@ -1,6 +1,6 @@
 # CareerOS — Architecture & Implementation Plan (v3)
 
-Status: **APPROVED (with amendments in §0).** M0 and M1 are in scope; M2+ await review.
+Status: **APPROVED (with amendments in §0).** M0, M1 and M2 implemented; M3+ await approval.
 Nothing is deployed, purchased or configured against a paid service.
 
 ---
@@ -18,6 +18,7 @@ These decisions override anything below that conflicts with them.
 | A5 | Manual AI bridge is an **optional future capability**. It is never required for normal operation. | §6.1 |
 | A6 | GitHub Actions CI runs within the free allowance. No paid CI. Session-based testing stays available. | §11, §13 (M0) |
 | A7 | **Resumable objectives.** The manager does not run continuously, but task execution, results, checkpoints and outstanding work persist and survive the end of any single execution session. | §7.3, §9.3 |
+| A8 | **M2 scope (2026-11-23):** M2 delivers the provider-neutral model layer, mock adapters, adaptive routing, cost and quality controls, *and* the Career Manager coordinator (playbooks, model-assisted planning, decomposition, review, decision table, approvals, recovery). Tasks run one at a time in M2; concurrent execution moves to M3. | §13, §15 |
 
 CareerOS is a standalone, local-first career intelligence and internship application agent.
 It shares no code, database, agents, infrastructure or modules with any other project. Ideas
@@ -818,12 +819,13 @@ CareerOS/
 │   ├── storage/                   # data-dir resolution, PersonalDataStore, BlobStore, SQLite/local impls
 │   ├── domain/                    # pydantic models + repositories: profile, jobs, companies, applications, orchestration
 │   ├── llm/
-│   │   ├── base.py                # ModelRequest/Response, Effort, ModelAdapter protocol
+│   │   ├── contracts.py           # ModelRequest/Response, OutputSchema, errors
+│   │   ├── base.py                # ModelAdapter protocol
 │   │   ├── gateway.py             # safety → budget → cache → adapter → ledger
 │   │   ├── safety.py              # real-execution locks
-│   │   ├── registry.py            # loads models.yaml
+│   │   ├── registry.py            # offline-only adapter registry
 │   │   ├── tokens.py              # provider-neutral token estimation
-│   │   └── adapters/              # mock.py, scripted.py, manual_bridge.py, (disabled stubs)
+│   │   └── adapters/              # mock.py, scripted.py (offline only; real adapters at M10)
 │   ├── routing/                   # complexity.py, policy.py, router.py, escalation.py, stats.py
 │   ├── cost/                      # pricing.py, ledger.py, budget.py, reports.py
 │   ├── cache/                     # keys.py, store.py, singleflight.py
@@ -879,9 +881,9 @@ one starts. All milestones through M9 run entirely on mock, scripted or manual a
 |---|---|---|---|
 | **M0** | Scaffold | pyproject, package layout, ruff/mypy/pytest, `.gitignore` with personal-data patterns, README, ADR template, GitHub Actions CI | `pytest`, `ruff` and `mypy` pass locally; CI workflow is valid |
 | **M1** | Core and data | Typed config loader (models/routing/eligibility config templates, mock-only), storage abstraction (§9.2), SQLite + migration runner, full schema (§10), domain models and repositories, synthetic fixtures, `careeros init/status/config` | Schema created; repository round-trip tests pass; data dir can't be inside the repo; unknown work authorization is the default; task state survives closing and reopening the database |
-| **M2** | Model layer and cost | Adapter protocol, `mock` and `scripted` adapters (fault injection), registry, token estimation, gateway, ledger, hierarchical budgets with reservations, cache + single-flight, **safety gate** | Tests prove: no real call possible by default; budget stops calls; cache prevents duplicates; simulated cost is recorded |
-| **M3** | Orchestration engine | State machine, DAG, scheduler with bounded parallelism, leases + crash recovery, idempotency, `WorkerResult` validation, review-task insertion | Tests: parallel independent tasks; dependency order; kill mid-run → `resume` completes without redoing work |
-| **M4** | Manager and router | Playbooks, planner, complexity estimator, quality-adjusted routing, escalation ladder, decision table, replanning, definition-of-done checking, `routing_stats` learning, **simulation harness** (optional manual bridge may follow, A5) | Simulated scenarios (easy / hard / flaky / over-budget / ineligible) produce the expected routes, escalations, stops and cost reports |
+| **M2** | Model layer, routing, cost, Career Manager (A8) | Provider-neutral adapter protocol; `mock` and `scripted` adapters (capability, cost, latency, malformed/invalid/timeout/rate-limit/low-confidence outcomes); offline-only registry and per-call safety gate; gateway with token/cost ledger; hierarchical budgets with reservations; accepted-result cache; complexity estimator; quality-adjusted router with history; decision table; playbooks + model-assisted planning; independent review; replanning; approval requests; checkpoint-based recovery; cost/quality report; `demo/resume/report/approvals/approve` CLI | **Done.** 141 tests; real execution proven impossible (§15.6) |
+| **M3** | Concurrent orchestration | Execute independent tasks of a wave concurrently (bounded `max_concurrency`, per-provider rate limits), lease heartbeats and expiry-based recovery across concurrent workers, single-writer DB queue, wall-clock task timeouts | Parallel waves complete faster with identical results; killed workers' leases expire and are recovered |
+| **M4** | Manager hardening and evaluation | Golden-set simulation harness with many seeded runs, routing-prior calibration report, exploration policy, richer definition-of-done checks, optional manual AI bridge (A5) | Calibration and cost/quality reports over ≥100 simulated objectives |
 | **M5** | Profile | Import profile from YAML/Markdown into `profile_facts`; writing samples; stylometric style profile; `careeros profile show/validate` | Your real profile loads; facts are citable; style vector is computed |
 | **M6** | Discovery and eligibility | **First: ADR verifying each source's current endpoints, rate limits and terms (A4).** Then Greenhouse/Lever/Ashby public board clients + manual URL/paste import; normalize, dedupe, filter; job analysis; configurable eligibility rules with `needs_user_confirmation` | Fixture-based tests pass; live fetch only after the ADR and the environment network allowlist are approved. No LinkedIn or Indeed scraping |
 | **M7** | Research and matching | Bounded employer research with caching and freshness; TF-IDF/rule matching; shortlist report | Repeated research on the same company costs $0; ranked shortlist produced |
@@ -901,3 +903,92 @@ Still open (none blocks M0/M1):
 1. **Durable personal storage** (§9.3): how real profile data and task state should persist across cloud containers. Deferred; nothing selected.
 2. **Your eligibility inputs**: enter them yourself later through the CLI (M5). Until then every authorization is `unknown`.
 3. **Network allowlist for job-board hosts**: to be requested at M6 after the terms review.
+4. **Routing priors and quality floors** (`config/routing.yaml`) are starting guesses. They
+   are easy to tune and will be calibrated in M4; tell me if you want different floors per
+   priority, or `high` added to the never-downgrade list.
+5. **Concurrency (M3)**: whether parallel execution of independent tasks is worth the added
+   complexity now, given that model calls are simulated until real execution is approved.
+
+
+---
+
+## 15. M2 implementation notes
+
+### 15.1 Module map
+
+| Module | Responsibility |
+|---|---|
+| `llm/contracts.py` | `ModelRequest`, `ModelResponse`, `OutputSchema`, error types (provider-neutral) |
+| `llm/base.py` | `ModelAdapter` protocol: `call(profile, request)`, `map_effort(effort)` |
+| `llm/adapters/mock.py` | Seeded simulator: capability (`simulation.skill`), effort, latency, failure rates |
+| `llm/adapters/scripted.py` | Forces exact outcomes per task type / model for tests and demos |
+| `llm/registry.py`, `llm/safety.py` | Offline-only adapter registry; per-call gate (mode, provider, adapter, enabled) |
+| `llm/gateway.py` | gate → cache → estimate → reserve → adapter → parse → ledger → settle |
+| `cost/budget.py`, `cost/pricing.py`, `cost/report.py` | Budgets with reservations; token pricing; cost/quality report |
+| `cache/store.py` | Cache of *accepted* results only |
+| `routing/complexity.py`, `routing/router.py`, `routing/stats.py` | Complexity features; model+effort selection; outcome history |
+| `workers/base.py`, `workers/generic.py` | Worker contracts; generic model step; deterministic utilities |
+| `manager/plans.py`, `manager/decisions.py`, `manager/manager.py` | Plans/playbooks/waves; decision table; the coordinator |
+| `simulation.py` | Demo scenarios: standard, escalation, budget, interrupt, novel |
+| `config/playbooks/*.yaml` | Demonstration playbooks (generic workers; real specialists arrive in M6–M8) |
+| `migrations/0002_*.sql` | `tasks.mode/optional/current_model_id`, `model_calls.objective_id/purpose`, `approval_requests` |
+
+### 15.2 Connecting a real provider later (M10, only with approval)
+
+1. Implement one class satisfying `ModelAdapter`: translate `ModelRequest` to the provider's
+   API, map `effort` (`none…max`) to its reasoning controls, return token counts.
+2. Mark it `offline = False`, and extend the registry and safety gate *only* under the M10
+   approval process (approval record, verified prices, budget cap, key via environment).
+3. Add profiles to `models.yaml` (`provider`, `provider_model`, `tier`, `capabilities`,
+   `effort_levels`, verified `pricing`). For Anthropic, the high-, medium- and low-cost model
+   families would be tier 1, 2 and 3 profiles. Nothing in the router, manager or workers
+   names a model or provider, so none of them change.
+
+### 15.3 Routing rule (as implemented)
+
+For every enabled `(model, effort)` allowed by the task type (`min_tier`,
+`required_capabilities`, efforts ≥ the policy default):
+
+* `p` = Beta posterior: prior `0.97 − 1.5·max(0, complexity − (tier_skill + effort_bonus))`
+  with strength `prior_strength`, updated by `routing_stats` for the same
+  (task type, complexity bucket, model, effort);
+* `c` = estimated cost of one call (real prompt size, expected output × effort multiplier);
+* `E` = expected cost to an accepted result: `E_i = c_i + (1−p_i)·min E_j over p_j > p_i`,
+  and `E_top = c_top / p_top`.
+
+Choose min `E` among `p ≥ floor(priority)` and `c ≤ remaining budget` (task, objective and
+monthly, whichever is smallest). Otherwise: priorities in `no_degrade_priorities`
+(default `critical`) → `needs_approval`; other priorities → explicitly recorded `degraded`
+choice if anything is affordable, else `needs_approval`. Retries reuse the model; effort
+escalation keeps the model and raises effort; tier escalation requires a stronger tier.
+
+### 15.4 Manager loop
+
+`submit` → playbook match (exact kind, else unambiguous keywords) or model-assisted planning
+(validated, escalated on invalid plans, else a clarification request) → tasks + dependencies
++ waves persisted. `run` → recover interrupted tasks → repeatedly pick the first ready task
+in wave order → deterministic step or routed model step → validate → deterministic checks →
+independent model review for important deliverables (a different model than the author) →
+decision table → accept / retry / escalate / replan (prune dependents) / ask the user →
+stop when the definition of done is met (remaining optional work is cancelled).
+
+### 15.5 Persistence and recovery
+
+Persisted per event: plan versions with waves; every routing decision with all candidates
+(`p`, `c`, `E`, floor, budget); every model call (tokens, latency, estimated and simulated
+cost, status, purpose); every result and review; every retry, escalation, replan, approval
+request and stop; a `model_response` checkpoint per model attempt. A new session marks tasks
+left running by a dead session as ready at the same attempt number; the checkpoint supplies
+the model response, so completed work is neither repeated nor re-billed.
+
+### 15.6 Why real execution is impossible in M2
+
+1. Config rejects `mode: real|manual`, `allow_real_models: true`, a non-zero real budget and
+   any enabled non-mock provider — from files *and* environment variables.
+2. The only adapters in the codebase are `mock` and `scripted` (a test pins the file list).
+3. The registry refuses any adapter that is not offline or serves a non-offline provider.
+4. The gateway re-checks mode, provider, adapter and enabled state on every call, so even a
+   configuration that bypasses validation is refused.
+5. No module imports a network library or vendor SDK (AST test); full scenarios pass with
+   sockets disabled; API keys in the environment are ignored.
+6. The database rejects any non-real call recorded as non-simulated cost.

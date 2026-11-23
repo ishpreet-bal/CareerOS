@@ -1,0 +1,66 @@
+# M2 DEMONSTRATION playbook. Its steps use generic workers and mock models to exercise
+# planning, routing, review, retries and escalation. Real specialist workers (research,
+# tailoring, cover letters) replace these generic steps in M6-M8.
+name: demo_application_package
+description: Prepare a (synthetic) application package for one job posting.
+keywords: [application, package, apply, resume, cover, letter, prepare]
+priority: high
+budget_usd: 1.00
+definition_of_done: ["accepted:all_required"]
+plan:
+  steps:
+    - id: extract_keywords
+      worker: extract_keywords
+      mode: deterministic
+      task_type: job.normalize
+      title: Extract posting keywords (code, no model)
+
+    - id: research_company
+      worker: model_step
+      task_type: research.company
+      title: Summarize the employer
+      instructions: Summarize what the employer builds and three talking points for a candidate.
+      output: {required: [summary, talking_points], types: {summary: string, talking_points: list}}
+
+    - id: classify_role
+      worker: model_step
+      task_type: job.classify_role
+      title: Classify the role family
+      depends_on: [extract_keywords]
+      instructions: Classify the role as ai_ml, swe, embedded, data or other using the keywords.
+      output: {required: [role_family, rationale], types: {role_family: string, rationale: string}}
+
+    - id: tailor_resume
+      worker: model_step
+      task_type: resume.tailor
+      title: Tailor resume bullets
+      depends_on: [classify_role, research_company]
+      instructions: Rewrite resume bullets for this role using only the candidate's facts.
+      params: {true_complexity: 0.66}
+      output: {required: [bullets, fact_ids], types: {bullets: list, fact_ids: list}}
+
+    - id: draft_cover_letter
+      worker: model_step
+      task_type: cover_letter.draft
+      title: Draft cover letter
+      depends_on: [classify_role, research_company]
+      instructions: Draft a concise cover letter grounded in the research and candidate facts.
+      params: {true_complexity: 0.70}
+      output: {required: [letter], types: {letter: string}}
+
+    - id: assemble
+      worker: assemble_package
+      mode: deterministic
+      task_type: job.normalize
+      title: Assemble package (code, no model)
+      depends_on: [tailor_resume, draft_cover_letter]
+
+    - id: strategic_review
+      worker: model_step
+      task_type: manager.strategic_review
+      title: Final strategic review
+      depends_on: [assemble]
+      priority: critical
+      review: false
+      instructions: Decide whether this package is ready for the user to review and submit.
+      output: {required: [verdict, recommendations], types: {verdict: string, recommendations: list}}

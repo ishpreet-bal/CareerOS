@@ -15,8 +15,8 @@ storage:
 budgets:
   real_monthly_usd: 0.0    # must stay 0.0 until real spending is explicitly approved
   simulated_monthly_usd: 5.0
-  default_objective_usd: 0.50
-  default_task_usd: 0.10
+  default_objective_usd: 1.00
+  default_task_usd: 0.25
 
 limits:
   max_attempts: 3

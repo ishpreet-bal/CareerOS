@@ -1,0 +1,20 @@
+# M2 demonstration playbook: cheap triage of one posting (mostly deterministic).
+name: job_triage
+description: Extract keywords and classify a job posting.
+keywords: [triage, classify, posting, job, role]
+priority: normal
+definition_of_done: ["accepted:classify_role"]
+plan:
+  steps:
+    - id: extract_keywords
+      worker: extract_keywords
+      mode: deterministic
+      task_type: job.normalize
+      title: Extract posting keywords
+    - id: classify_role
+      worker: model_step
+      task_type: job.classify_role
+      title: Classify the role family
+      depends_on: [extract_keywords]
+      instructions: Classify the role as ai_ml, swe, embedded, data or other.
+      output: {required: [role_family], types: {role_family: string}}

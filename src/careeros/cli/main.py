@@ -12,6 +12,9 @@ from careeros import __version__
 from careeros.context import open_context
 from careeros.core.config import AppConfig, load_config
 from careeros.core.errors import CareerOSError
+from careeros.cost.report import build_report, format_report
+from careeros.manager.manager import CareerManager
+from careeros.simulation import SCENARIOS, run_scenario
 from careeros.storage.location import resolve_data_dir
 from careeros.synthetic import seed_synthetic
 
@@ -92,6 +95,83 @@ def status(config_dir: ConfigDirOpt = None) -> None:
             typer.echo(f"Outstanding    : {len(outstanding)} task(s)")
             for t in outstanding:
                 typer.echo(f"  - task {t.id} [{t.status.value}] {t.task_type}: {t.title or ''}")
+    except CareerOSError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+
+@app.command()
+def demo(
+    scenario: Annotated[str, typer.Option(help=f"One of: {', '.join(SCENARIOS)}")] = "standard",
+    config_dir: ConfigDirOpt = None,
+) -> None:
+    """Run an offline demonstration objective (synthetic data, mock models only)."""
+    cfg = _load(config_dir)
+    try:
+        with open_context(cfg) as ctx:
+            result = run_scenario(ctx, scenario)
+            typer.echo(f"Scenario '{scenario}' (all model calls simulated)\n")
+            typer.echo("\n".join(result.events))
+            typer.echo("")
+            typer.echo(format_report(build_report(ctx.db, result.objective_id)))
+    except CareerOSError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+
+@app.command()
+def resume(objective_id: int, config_dir: ConfigDirOpt = None) -> None:
+    """Resume an interrupted or approved objective from its persisted state."""
+    cfg = _load(config_dir)
+    try:
+        with open_context(cfg) as ctx:
+            summary = CareerManager(ctx).run(objective_id)
+            typer.echo("\n".join(summary.events))
+            typer.echo(f"Objective {objective_id}: {summary.status.value} ({summary.stop_reason})")
+    except CareerOSError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+
+@app.command()
+def report(objective_id: int, config_dir: ConfigDirOpt = None) -> None:
+    """Show the simulated cost and quality report for an objective."""
+    cfg = _load(config_dir)
+    try:
+        with open_context(cfg) as ctx:
+            typer.echo(format_report(build_report(ctx.db, objective_id)))
+    except CareerOSError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+
+@app.command()
+def approvals(config_dir: ConfigDirOpt = None) -> None:
+    """List requests waiting for your decision."""
+    cfg = _load(config_dir)
+    with open_context(cfg) as ctx:
+        pending = CareerManager(ctx).pending_requests()
+        if not pending:
+            typer.echo("No pending requests.")
+        for r in pending:
+            typer.echo(
+                f"#{r['id']} objective {r['objective_id']} task {r['task_id']} "
+                f"[{r['kind']}]: {r['details'].get('reason') or r['details']}"
+            )
+
+
+@app.command()
+def approve(
+    request_id: int,
+    usd: Annotated[float, typer.Option(help="Extra SIMULATED budget to allow.")] = 0.0,
+    config_dir: ConfigDirOpt = None,
+) -> None:
+    """Approve a pending request (budget amounts are simulated; nothing is charged)."""
+    cfg = _load(config_dir)
+    try:
+        with open_context(cfg) as ctx:
+            CareerManager(ctx).approve(request_id, extra_usd=usd)
+            typer.echo(f"Request {request_id} approved. Run `careeros resume <objective>`.")
     except CareerOSError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(1) from exc

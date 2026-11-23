@@ -26,6 +26,8 @@ ExecutionMode = Literal["mock", "scripted", "manual", "real"]
 DatasetKind = Literal["synthetic", "personal"]
 Priority = Literal["low", "normal", "high", "critical"]
 Effort = Literal["none", "low", "medium", "high", "max"]
+#: Reasoning-effort levels from least to most expensive.
+EFFORT_ORDER: tuple[Effort, ...] = ("none", "low", "medium", "high", "max")
 
 ENV_CONFIG_DIR = "CAREEROS_CONFIG_DIR"
 ENV_DATA_DIR = "CAREEROS_DATA_DIR"
@@ -70,8 +72,8 @@ class BudgetConfig(_Strict):
     #: Real-money budget. Must stay 0.0 until real execution is explicitly approved.
     real_monthly_usd: float = 0.0
     simulated_monthly_usd: float = Field(default=5.0, ge=0)
-    default_objective_usd: float = Field(default=0.50, ge=0)
-    default_task_usd: float = Field(default=0.10, ge=0)
+    default_objective_usd: float = Field(default=1.00, ge=0)
+    default_task_usd: float = Field(default=0.25, ge=0)
 
     @field_validator("real_monthly_usd")
     @classmethod
@@ -132,29 +134,71 @@ class Pricing(_Strict):
     verified_at: str | None = None
 
 
+class SimulationProfile(_Strict):
+    """Behaviour of an offline mock model. Only valid for offline providers."""
+
+    #: Complexity (0..1) this model handles reliably at effort 'none'.
+    skill: float = Field(ge=0, le=1)
+    base_latency_ms: int = Field(default=300, ge=0)
+    ms_per_output_token: float = Field(default=5.0, ge=0)
+    malformed_rate: float = Field(default=0.0, ge=0, le=1)
+    invalid_rate: float = Field(default=0.0, ge=0, le=1)
+    timeout_rate: float = Field(default=0.0, ge=0, le=1)
+    rate_limit_rate: float = Field(default=0.0, ge=0, le=1)
+    timeout_ms: int = Field(default=60_000, ge=1)
+
+
 class ModelProfile(_Strict):
+    """A provider-neutral capability profile.
+
+    ``id`` is CareerOS's own name for the profile. ``provider_model`` is the identifier the
+    provider's API expects; it is opaque to the router and manager and is only read by the
+    provider adapter.
+    """
+
     id: str
     provider: str
+    provider_model: str | None = None
     tier: int = Field(ge=1, le=3)
     capabilities: tuple[str, ...] = ()
     context_window: int = Field(default=8_000, ge=1)
     effort_levels: tuple[Effort, ...] = ("none",)
     pricing: Pricing = Pricing()
+    simulation: SimulationProfile | None = None
     enabled: bool = False
+
+    @property
+    def is_offline(self) -> bool:
+        return self.provider in OFFLINE_PROVIDERS
+
+    def max_effort(self) -> Effort:
+        return max(self.effort_levels, key=EFFORT_ORDER.index)
 
     @model_validator(mode="after")
     def _offline_only(self) -> ModelProfile:
+        if self.simulation is not None and not self.is_offline:
+            raise ValueError(f"Model {self.id!r}: simulation settings are only valid for mocks.")
         if self.enabled and self.provider not in OFFLINE_PROVIDERS:
             raise ValueError(
                 f"Model {self.id!r}: provider {self.provider!r} cannot be enabled. Only "
                 f"offline providers {sorted(OFFLINE_PROVIDERS)} are allowed before M10 approval."
             )
+        if self.enabled and (
+            self.pricing.input_per_mtok is None or self.pricing.output_per_mtok is None
+        ):
+            raise ValueError(f"Model {self.id!r}: an enabled model needs pricing.")
         return self
 
 
 class TaskTypePolicy(_Strict):
     base_complexity: float = Field(default=0.3, ge=0, le=1)
+    #: Lowest-capability tier allowed (tier 3 is the cheapest, tier 1 the strongest):
+    #: a task may use any model whose tier number is <= min_tier.
     min_tier: int = Field(default=3, ge=1, le=3)
+    expected_input_tokens: int = Field(default=800, ge=1)
+    expected_output_tokens: int = Field(default=400, ge=1)
+    #: Capabilities a model profile must declare to be considered.
+    required_capabilities: tuple[str, ...] = ()
     default_effort: Effort = "none"
     important: bool = False
     deterministic_first: bool = True
@@ -168,11 +212,41 @@ _DEFAULT_FLOORS: dict[Priority, float] = {
 }
 
 
+def _default_tier_skill() -> dict[int, float]:
+    return {1: 0.9, 2: 0.7, 3: 0.45}
+
+
+def _default_effort_bonus() -> dict[Effort, float]:
+    return {"none": 0.0, "low": 0.03, "medium": 0.06, "high": 0.09, "max": 0.11}
+
+
+def _default_effort_multiplier() -> dict[Effort, float]:
+    return {"none": 1.0, "low": 1.5, "medium": 2.0, "high": 3.0, "max": 4.0}
+
+
 class RoutingConfig(_Strict):
     quality_floors: dict[Priority, float] = Field(default_factory=lambda: dict(_DEFAULT_FLOORS))
+    #: Not used in M2: routing is deterministic so results are reproducible.
     exploration_rate: float = Field(default=0.05, ge=0, le=0.5)
     prior_strength: float = Field(default=4.0, gt=0)
+    #: Prior belief about the complexity each tier handles reliably (before any history).
+    tier_skill: dict[int, float] = Field(default_factory=_default_tier_skill)
+    #: How much each effort level adds to a model's effective skill (prior only).
+    effort_bonus: dict[Effort, float] = Field(default_factory=_default_effort_bonus)
+    #: Output-token multiplier for reasoning effort (thinking tokens are billed as output).
+    effort_output_multiplier: dict[Effort, float] = Field(
+        default_factory=_default_effort_multiplier
+    )
+    #: Priorities whose quality floor is never lowered to fit a budget (ask instead).
+    no_degrade_priorities: tuple[Priority, ...] = ("critical",)
+    #: Effective confidence below this is treated as a low-confidence result.
+    confidence_threshold: float = Field(default=0.7, ge=0, le=1)
+    #: Minimum reviewer score to accept an important deliverable.
+    review_accept_score: float = Field(default=0.75, ge=0, le=1)
     task_types: dict[str, TaskTypePolicy] = Field(default_factory=dict)
+
+    def policy(self, task_type: str) -> TaskTypePolicy:
+        return self.task_types.get(task_type, TaskTypePolicy())
 
     @field_validator("quality_floors")
     @classmethod

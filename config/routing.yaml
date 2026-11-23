@@ -1,18 +1,25 @@
-# Routing policy per task type. Consumed by the router (M4); validated from M1.
+# Routing policy. Tiers: 1 = strongest, 3 = cheapest. A task may use any tier whose number
+# is <= min_tier. Expected token counts drive pre-call cost estimates.
 quality_floors: {low: 0.60, normal: 0.75, high: 0.85, critical: 0.92}
-exploration_rate: 0.05
+exploration_rate: 0.05          # not used in M2 (deterministic routing)
 prior_strength: 4.0
+tier_skill: {1: 0.90, 2: 0.70, 3: 0.45}
+effort_bonus: {none: 0.0, low: 0.03, medium: 0.06, high: 0.09, max: 0.11}
+effort_output_multiplier: {none: 1.0, low: 1.5, medium: 2.0, high: 3.0, max: 4.0}
+no_degrade_priorities: [critical]
+confidence_threshold: 0.70
+review_accept_score: 0.75
 
 task_types:
-  job.normalize:            {base_complexity: 0.05, min_tier: 3, default_effort: none}
-  job.classify_role:        {base_complexity: 0.20, min_tier: 3, default_effort: none}
-  job.analyze:              {base_complexity: 0.35, min_tier: 3, default_effort: none}
-  eligibility.assess:       {base_complexity: 0.30, min_tier: 3, default_effort: none}
-  research.company:         {base_complexity: 0.50, min_tier: 2, default_effort: low}
-  match.rationale:          {base_complexity: 0.40, min_tier: 3, default_effort: none}
-  resume.tailor:            {base_complexity: 0.60, min_tier: 2, default_effort: low, important: true}
-  cover_letter.draft:       {base_complexity: 0.65, min_tier: 2, default_effort: medium, important: true}
-  application.answers:      {base_complexity: 0.55, min_tier: 2, default_effort: low, important: true}
-  quality.review:           {base_complexity: 0.50, min_tier: 2, default_effort: low}
-  manager.plan_novel:       {base_complexity: 0.80, min_tier: 1, default_effort: medium, deterministic_first: true}
-  manager.strategic_review: {base_complexity: 0.85, min_tier: 1, default_effort: high}
+  job.normalize:            {base_complexity: 0.05, min_tier: 3, default_effort: none, expected_output_tokens: 150}
+  job.classify_role:        {base_complexity: 0.20, min_tier: 3, default_effort: none, expected_output_tokens: 120}
+  job.analyze:              {base_complexity: 0.35, min_tier: 3, default_effort: none, expected_output_tokens: 300}
+  eligibility.assess:       {base_complexity: 0.30, min_tier: 3, default_effort: none, expected_output_tokens: 200}
+  research.company:         {base_complexity: 0.50, min_tier: 2, default_effort: low, expected_input_tokens: 1500, expected_output_tokens: 500}
+  match.rationale:          {base_complexity: 0.40, min_tier: 3, default_effort: none, expected_output_tokens: 250}
+  resume.tailor:            {base_complexity: 0.60, min_tier: 2, default_effort: low, important: true, expected_input_tokens: 1800, expected_output_tokens: 700}
+  cover_letter.draft:       {base_complexity: 0.65, min_tier: 2, default_effort: medium, important: true, expected_input_tokens: 1500, expected_output_tokens: 600}
+  application.answers:      {base_complexity: 0.55, min_tier: 2, default_effort: low, important: true, expected_output_tokens: 500}
+  quality.review:           {required_capabilities: [review], base_complexity: 0.50, min_tier: 2, default_effort: low, expected_input_tokens: 1200, expected_output_tokens: 250}
+  manager.plan_novel:       {required_capabilities: [planning], base_complexity: 0.80, min_tier: 1, default_effort: medium, expected_input_tokens: 1000, expected_output_tokens: 500}
+  manager.strategic_review: {required_capabilities: [review], base_complexity: 0.85, min_tier: 1, default_effort: high, expected_input_tokens: 2000, expected_output_tokens: 400}

@@ -365,6 +365,7 @@ class Task(_Model):
     escalations: int = Field(default=0, ge=0)
     current_tier: int | None = Field(default=None, ge=1, le=3)
     current_effort: str | None = None
+    current_model_id: str | None = None
     idempotency_key: str | None = None
     lease_owner: str | None = None
     lease_expires_at: str | None = None

@@ -41,6 +41,7 @@ OPERATIONAL_TABLES = frozenset(
         "cache_entries",
         "routing_stats",
         "approvals",
+        "approval_requests",
     }
 )
 

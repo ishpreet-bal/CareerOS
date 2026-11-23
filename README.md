@@ -3,13 +3,16 @@
 Local-first AI career intelligence and internship application agent.
 Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-**Current status: M0 + M1** (project setup, configuration, database, data models).
-The model router, orchestration engine and workers start at M2 and later.
+**Current status: M0 + M1 + M2.** Configuration, storage and data models; the
+provider-neutral model layer with mock adapters; adaptive model/effort routing; simulated
+cost and budget controls; and the Career Manager (playbooks, planning, review, retries,
+escalation, approvals, recovery). All model calls are simulated.
 
 ## Safety defaults
 
 - **Mock execution only.** The config loader rejects `mode: real`, any enabled non-mock
-  model provider, and any non-zero real-money budget.
+  model provider, and any non-zero real-money budget. Only offline adapters exist, and a
+  safety gate re-checks every call.
 - **No personal data in git.** Data lives outside the repository
   (`~/.local/share/careeros/<dataset_kind>` or `$CAREEROS_DATA_DIR`). CareerOS refuses to
   create a data directory inside any git working tree. All committed fixtures are synthetic.
@@ -38,6 +41,16 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 .venv/bin/careeros status
 ```
 
+Run an offline demonstration (synthetic data, mock models, simulated costs):
+
+```bash
+.venv/bin/careeros demo --scenario escalation
+```
+
+Scenarios: `standard`, `escalation`, `budget`, `interrupt`, `novel`. Related commands:
+`careeros approvals`, `careeros approve <id> --usd <simulated amount>`,
+`careeros resume <objective>`, `careeros report <objective>`.
+
 Use a throwaway location for experiments:
 
 ```bash
@@ -56,11 +69,19 @@ That runs `ruff check`, `ruff format --check`, `mypy --strict` and `pytest`. Git
 ## Layout
 
 ```
-config/            YAML templates (execution, storage, budgets, limits, eligibility, models, routing)
+config/            YAML templates (execution, storage, budgets, limits, eligibility, models,
+                   routing) and demonstration playbooks
 src/careeros/
   core/            config loader, SQLite wrapper, migration runner, migrations/
   storage/         data-dir guard, PersonalDataStore / BlobStore interfaces + local backends
   domain/          pydantic models and operational repositories
+  llm/             provider-neutral model interface, offline adapters, safety gate, gateway
+  routing/         complexity estimation, model + effort router, outcome history
+  cost/            pricing, budgets, cost/quality report
+  cache/           cache of accepted results
+  workers/         worker contracts and generic workers
+  manager/         Career Manager, plans/playbooks, decision table
+  simulation.py    offline demo scenarios
   cli/             `careeros` command
   synthetic.py     fictional development dataset
 tests/             unit and integration tests (synthetic data only)

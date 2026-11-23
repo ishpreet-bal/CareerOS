@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import re
-import socket
 import sqlite3
 import unicodedata
 import uuid
@@ -274,13 +274,13 @@ class OrchestrationRepository:
 
     # ---------------------------------------------------------------- sessions
     def start_session(self) -> str:
-        sid = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        sid = f"{platform.node()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         now = utc_now_iso()
         with self.db.transaction() as c:
             c.execute(
                 "INSERT INTO execution_sessions (id, started_at, last_heartbeat_at, host)"
                 " VALUES (?,?,?,?)",
-                (sid, now, now, socket.gethostname()),
+                (sid, now, now, platform.node()),
             )
         return sid
 
@@ -423,6 +423,7 @@ class OrchestrationRepository:
             escalations=r["escalations"],
             current_tier=r["current_tier"],
             current_effort=r["current_effort"],
+            current_model_id=r["current_model_id"],
             idempotency_key=r["idempotency_key"],
             lease_owner=r["lease_owner"],
             lease_expires_at=r["lease_expires_at"],
