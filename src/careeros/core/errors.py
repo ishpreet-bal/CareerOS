@@ -23,3 +23,11 @@ class MigrationError(CareerOSError):
 
 class NotFoundError(CareerOSError):
     """A requested record does not exist."""
+
+
+class SessionTerminatedError(CareerOSError):
+    """The execution session is ending abruptly (e.g. the process is being killed).
+
+    Never caught and converted into a task failure: state is left exactly as a crash
+    would leave it, and the next session recovers it.
+    """

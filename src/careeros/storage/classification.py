@@ -42,6 +42,7 @@ OPERATIONAL_TABLES = frozenset(
         "routing_stats",
         "approvals",
         "approval_requests",
+        "budget_reservations",
     }
 )
 

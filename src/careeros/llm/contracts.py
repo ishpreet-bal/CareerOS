@@ -92,8 +92,25 @@ class RealExecutionBlockedError(CareerOSError):
 
 
 class BudgetExceededError(CareerOSError):
-    def __init__(self, message: str, *, scope: str, needed_usd: float, available_usd: float):
+    def __init__(
+        self,
+        message: str,
+        *,
+        scope: str,
+        needed_usd: float,
+        available_usd: float,
+        reserved_usd: float = 0.0,
+        uncommitted_usd: float | None = None,
+    ):
         super().__init__(message)
         self.scope = scope
         self.needed_usd = needed_usd
         self.available_usd = available_usd
+        self.reserved_usd = reserved_usd
+        self.uncommitted_usd = available_usd if uncommitted_usd is None else uncommitted_usd
+
+    @property
+    def is_contention(self) -> bool:
+        """The call would fit if concurrent in-flight reservations were settled: wait and
+        retry rather than ask the user."""
+        return self.reserved_usd > 1e-12 and self.needed_usd <= self.uncommitted_usd + 1e-12

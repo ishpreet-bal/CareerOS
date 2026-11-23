@@ -29,7 +29,7 @@ from careeros.cost.pricing import call_cost_usd
 from careeros.routing.complexity import ComplexityEstimate
 from careeros.routing.stats import RoutingStatsRepository
 
-RouteStatus = Literal["routed", "degraded", "needs_approval", "no_candidate"]
+RouteStatus = Literal["routed", "degraded", "approved_downgrade", "needs_approval", "no_candidate"]
 Escalation = Literal["effort", "tier"]
 
 
@@ -159,6 +159,16 @@ class Router:
         return _with_expected_costs(out)
 
     # ---------------------------------------------------------------- selection
+    def floors(self, task_type: str, priority: str) -> tuple[float, float | None]:
+        """(quality floor, lowest automatic-downgrade floor or None if not allowed)."""
+        rc = self.config.routing
+        policy = rc.policy(task_type)
+        hard_min = max(rc.absolute_min_quality, policy.min_quality)
+        floor = max(rc.quality_floors.get(cast(Priority, priority), 0.75), policy.min_quality)
+        if priority in rc.no_degrade_priorities or priority not in rc.degrade_limits:
+            return floor, None
+        return floor, max(hard_min, floor - rc.degrade_limits[priority])
+
     def route(
         self,
         task_type: str,
@@ -170,9 +180,19 @@ class Router:
         exclude_models: frozenset[str] = frozenset(),
         current: tuple[str, Effort] | None = None,
         escalation: Escalation | None = None,
+        approved_floor: float | None = None,
     ) -> RouteDecision:
+        """Select a model and effort.
+
+        Priority policy:
+
+        * critical / high: never downgraded automatically -> ``needs_approval``;
+        * normal / low: downgraded at most ``degrade_limits[priority]`` below the floor and
+          never below ``max(absolute_min_quality, policy.min_quality)``; recorded;
+        * ``approved_floor``: a lower floor the user explicitly accepted for this task.
+        """
         rc = self.config.routing
-        floor = rc.quality_floors.get(cast(Priority, priority), 0.75)
+        floor, degrade_floor = self.floors(task_type, priority)
         cands = self.candidates(
             task_type,
             complexity,
@@ -219,6 +239,9 @@ class Router:
                 pool, key=lambda c: (c.expected_cost_usd, c.est_cost_usd, -c.tier, c.model_id)
             )
 
+        def strongest(pool: list[Candidate]) -> Candidate:
+            return max(pool, key=lambda c: (c.p_accept, -c.est_cost_usd))
+
         feasible = [c for c in cands if c.meets_floor and c.within_budget]
         if feasible:
             return decision(
@@ -229,40 +252,67 @@ class Router:
 
         meeting = [c for c in cands if c.meets_floor]
         affordable = [c for c in cands if c.within_budget]
-        if meeting:  # quality is reachable, but not within budget
-            needed = min(c.est_cost_usd for c in meeting)
-            if priority in rc.no_degrade_priorities or not affordable:
+        if not meeting:
+            # No model is expected to meet the floor at all: a capability limit, not a budget
+            # trade-off. Use the strongest affordable option; review decides acceptance.
+            if affordable:
                 return decision(
-                    "needs_approval",
-                    None,
-                    f"Meeting the {priority} quality floor ({floor:.2f}) needs ~${needed:.4f}; "
-                    f"only ${budget_available_usd:.4f} is available. Approval required.",
-                    needed_usd=needed,
+                    "routed",
+                    strongest(affordable),
+                    "No option is expected to meet the floor; using the strongest "
+                    "affordable option. Review decides acceptance.",
                 )
-            choice = max(affordable, key=lambda c: (c.p_accept, -c.est_cost_usd))
             return decision(
-                "degraded",
-                choice,
-                f"No in-budget option meets the floor {floor:.2f}; using the best affordable "
-                f"option (p={choice.p_accept:.2f}). Recorded as degraded.",
-                needed_usd=needed,
+                "needs_approval",
+                None,
+                "No affordable option for this task. Approval required.",
+                needed_usd=min(c.est_cost_usd for c in cands),
+                downgrade_option=None,
             )
 
-        # No model is expected to meet the floor at all: use the strongest option and rely
-        # on review and escalation; this is a capability limit, not a budget trade-off.
-        if affordable:
-            choice = max(affordable, key=lambda c: (c.p_accept, -c.est_cost_usd))
-            return decision(
-                "routed",
-                choice,
-                "No option is expected to meet the floor; using the strongest "
-                "affordable option. Review decides acceptance.",
-            )
+        # Quality is reachable, but not within the remaining budget.
+        needed = min(c.est_cost_usd for c in meeting)
+        hard_min = max(rc.absolute_min_quality, rc.policy(task_type).min_quality)
+        if approved_floor is not None:
+            approved = [c for c in affordable if c.p_accept >= max(approved_floor, hard_min)]
+            if approved:
+                choice = strongest(approved)
+                return decision(
+                    "approved_downgrade",
+                    choice,
+                    f"User-approved downgrade: floor {floor:.2f} -> {approved_floor:.2f} "
+                    f"(chosen p={choice.p_accept:.2f}).",
+                    needed_usd=needed,
+                    approved_floor=approved_floor,
+                )
+        if degrade_floor is not None:
+            within = [c for c in affordable if c.p_accept >= degrade_floor]
+            if within:
+                choice = strongest(within)
+                return decision(
+                    "degraded",
+                    choice,
+                    f"Automatic {priority}-priority downgrade within limits: floor "
+                    f"{floor:.2f}, chosen p={choice.p_accept:.2f} (limit {degrade_floor:.2f}).",
+                    needed_usd=needed,
+                    degrade_floor=degrade_floor,
+                )
+        option = [c for c in affordable if c.p_accept >= hard_min]
+        down = strongest(option) if option else None
+        why = (
+            "never downgraded automatically"
+            if degrade_floor is None
+            else f"no affordable option within the downgrade limit ({degrade_floor:.2f})"
+        )
         return decision(
             "needs_approval",
             None,
-            "No affordable option for this task. Approval required.",
-            needed_usd=min(c.est_cost_usd for c in cands),
+            f"Meeting the {priority} quality floor ({floor:.2f}) needs ~${needed:.4f}; only "
+            f"${budget_available_usd:.4f} is available ({priority} priority: {why}). "
+            "Approve a budget increase"
+            + (f" or a downgrade to p={down.p_accept:.2f}." if down else "."),
+            needed_usd=needed,
+            downgrade_option=asdict(down) if down else None,
         )
 
 

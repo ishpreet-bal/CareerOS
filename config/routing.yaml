@@ -6,7 +6,13 @@ prior_strength: 4.0
 tier_skill: {1: 0.90, 2: 0.70, 3: 0.45}
 effort_bonus: {none: 0.0, low: 0.03, medium: 0.06, high: 0.09, max: 0.11}
 effort_output_multiplier: {none: 1.0, low: 1.5, medium: 2.0, high: 3.0, max: 4.0}
-no_degrade_priorities: [critical]
+# Priority policy (architecture §5.4):
+#   critical, high -> never downgraded automatically; the user is asked (must be listed here)
+#   normal, low    -> may be downgraded automatically, at most `degrade_limits` below the floor
+#   every task     -> never below max(absolute_min_quality, the task type's min_quality)
+no_degrade_priorities: [critical, high]
+degrade_limits: {normal: 0.10, low: 0.20}
+absolute_min_quality: 0.50
 confidence_threshold: 0.70
 review_accept_score: 0.75
 
@@ -14,12 +20,12 @@ task_types:
   job.normalize:            {base_complexity: 0.05, min_tier: 3, default_effort: none, expected_output_tokens: 150}
   job.classify_role:        {base_complexity: 0.20, min_tier: 3, default_effort: none, expected_output_tokens: 120}
   job.analyze:              {base_complexity: 0.35, min_tier: 3, default_effort: none, expected_output_tokens: 300}
-  eligibility.assess:       {base_complexity: 0.30, min_tier: 3, default_effort: none, expected_output_tokens: 200}
+  eligibility.assess:       {min_quality: 0.85, base_complexity: 0.30, min_tier: 3, default_effort: none, expected_output_tokens: 200}
   research.company:         {base_complexity: 0.50, min_tier: 2, default_effort: low, expected_input_tokens: 1500, expected_output_tokens: 500}
   match.rationale:          {base_complexity: 0.40, min_tier: 3, default_effort: none, expected_output_tokens: 250}
-  resume.tailor:            {base_complexity: 0.60, min_tier: 2, default_effort: low, important: true, expected_input_tokens: 1800, expected_output_tokens: 700}
-  cover_letter.draft:       {base_complexity: 0.65, min_tier: 2, default_effort: medium, important: true, expected_input_tokens: 1500, expected_output_tokens: 600}
-  application.answers:      {base_complexity: 0.55, min_tier: 2, default_effort: low, important: true, expected_output_tokens: 500}
+  resume.tailor:            {min_quality: 0.80, base_complexity: 0.60, min_tier: 2, default_effort: low, important: true, expected_input_tokens: 1800, expected_output_tokens: 700}
+  cover_letter.draft:       {min_quality: 0.75, base_complexity: 0.65, min_tier: 2, default_effort: medium, important: true, expected_input_tokens: 1500, expected_output_tokens: 600}
+  application.answers:      {min_quality: 0.80, base_complexity: 0.55, min_tier: 2, default_effort: low, important: true, expected_output_tokens: 500}
   quality.review:           {required_capabilities: [review], base_complexity: 0.50, min_tier: 2, default_effort: low, expected_input_tokens: 1200, expected_output_tokens: 250}
   manager.plan_novel:       {required_capabilities: [planning], base_complexity: 0.80, min_tier: 1, default_effort: medium, expected_input_tokens: 1000, expected_output_tokens: 500}
   manager.strategic_review: {required_capabilities: [review], base_complexity: 0.85, min_tier: 1, default_effort: high, expected_input_tokens: 2000, expected_output_tokens: 400}

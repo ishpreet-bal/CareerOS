@@ -120,12 +120,22 @@ def demo(
 
 
 @app.command()
-def resume(objective_id: int, config_dir: ConfigDirOpt = None) -> None:
+def resume(
+    objective_id: int,
+    force_recover: Annotated[
+        bool,
+        typer.Option(
+            "--force-recover",
+            help="Treat all other sessions as dead (only if no other CareerOS process runs).",
+        ),
+    ] = False,
+    config_dir: ConfigDirOpt = None,
+) -> None:
     """Resume an interrupted or approved objective from its persisted state."""
     cfg = _load(config_dir)
     try:
         with open_context(cfg) as ctx:
-            summary = CareerManager(ctx).run(objective_id)
+            summary = CareerManager(ctx).run(objective_id, force_recover=force_recover)
             typer.echo("\n".join(summary.events))
             typer.echo(f"Objective {objective_id}: {summary.status.value} ({summary.stop_reason})")
     except CareerOSError as exc:
@@ -164,13 +174,20 @@ def approvals(config_dir: ConfigDirOpt = None) -> None:
 def approve(
     request_id: int,
     usd: Annotated[float, typer.Option(help="Extra SIMULATED budget to allow.")] = 0.0,
+    accept_downgrade: Annotated[
+        bool,
+        typer.Option(
+            "--accept-downgrade",
+            help="Instead of more budget, accept the lower-quality option the request offers.",
+        ),
+    ] = False,
     config_dir: ConfigDirOpt = None,
 ) -> None:
     """Approve a pending request (budget amounts are simulated; nothing is charged)."""
     cfg = _load(config_dir)
     try:
         with open_context(cfg) as ctx:
-            CareerManager(ctx).approve(request_id, extra_usd=usd)
+            CareerManager(ctx).approve(request_id, extra_usd=usd, accept_downgrade=accept_downgrade)
             typer.echo(f"Request {request_id} approved. Run `careeros resume <objective>`.")
     except CareerOSError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)

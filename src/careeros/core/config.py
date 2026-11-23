@@ -45,7 +45,8 @@ class _Strict(BaseModel):
 class ExecutionConfig(_Strict):
     mode: ExecutionMode = "mock"
     allow_real_models: bool = False
-    max_concurrency: int = Field(default=4, ge=1, le=32)
+    #: Upper bound on concurrently executing tasks (worker threads) per run.
+    max_concurrency: int = Field(default=3, ge=1, le=16)
 
     @model_validator(mode="after")
     def _no_real_execution(self) -> ExecutionConfig:
@@ -74,6 +75,8 @@ class BudgetConfig(_Strict):
     simulated_monthly_usd: float = Field(default=5.0, ge=0)
     default_objective_usd: float = Field(default=1.00, ge=0)
     default_task_usd: float = Field(default=0.25, ge=0)
+    #: Cap on simulated spend by one execution session (one `run`/`resume` invocation).
+    session_simulated_usd: float = Field(default=2.0, ge=0)
 
     @field_validator("real_monthly_usd")
     @classmethod
@@ -97,6 +100,8 @@ class LimitsConfig(_Strict):
     max_tasks_per_objective: int = Field(default=100, ge=1)
     task_timeout_seconds: int = Field(default=300, ge=1)
     lease_seconds: int = Field(default=120, ge=10)
+    #: How often a live session renews its task leases (default: a third of the lease).
+    heartbeat_seconds: float | None = Field(default=None, gt=0)
     research: ResearchLimits = ResearchLimits()
 
 
@@ -197,6 +202,9 @@ class TaskTypePolicy(_Strict):
     min_tier: int = Field(default=3, ge=1, le=3)
     expected_input_tokens: int = Field(default=800, ge=1)
     expected_output_tokens: int = Field(default=400, ge=1)
+    #: Hard minimum acceptance probability for this task type regardless of priority or
+    #: downgrade (e.g. factual deliverables such as resumes).
+    min_quality: float = Field(default=0.0, ge=0, le=1)
     #: Capabilities a model profile must declare to be considered.
     required_capabilities: tuple[str, ...] = ()
     default_effort: Effort = "none"
@@ -220,6 +228,10 @@ def _default_effort_bonus() -> dict[Effort, float]:
     return {"none": 0.0, "low": 0.03, "medium": 0.06, "high": 0.09, "max": 0.11}
 
 
+def _default_degrade_limits() -> dict[Priority, float]:
+    return {"normal": 0.10, "low": 0.20}
+
+
 def _default_effort_multiplier() -> dict[Effort, float]:
     return {"none": 1.0, "low": 1.5, "medium": 2.0, "high": 3.0, "max": 4.0}
 
@@ -237,8 +249,14 @@ class RoutingConfig(_Strict):
     effort_output_multiplier: dict[Effort, float] = Field(
         default_factory=_default_effort_multiplier
     )
-    #: Priorities whose quality floor is never lowered to fit a budget (ask instead).
-    no_degrade_priorities: tuple[Priority, ...] = ("critical",)
+    #: Priorities whose quality floor is never lowered automatically; the user is asked.
+    #: Must include critical and high.
+    no_degrade_priorities: tuple[Priority, ...] = ("critical", "high")
+    #: How far below its floor a task of this priority may be downgraded automatically.
+    #: Priorities not listed here cannot be downgraded automatically.
+    degrade_limits: dict[Priority, float] = Field(default_factory=_default_degrade_limits)
+    #: No automatic or approved choice may fall below this acceptance probability.
+    absolute_min_quality: float = Field(default=0.5, ge=0, le=1)
     #: Effective confidence below this is treated as a low-confidence result.
     confidence_threshold: float = Field(default=0.7, ge=0, le=1)
     #: Minimum reviewer score to accept an important deliverable.
@@ -247,6 +265,24 @@ class RoutingConfig(_Strict):
 
     def policy(self, task_type: str) -> TaskTypePolicy:
         return self.task_types.get(task_type, TaskTypePolicy())
+
+    @model_validator(mode="after")
+    def _priority_policy(self) -> RoutingConfig:
+        missing = {"critical", "high"} - set(self.no_degrade_priorities)
+        if missing:
+            raise ValueError(
+                f"no_degrade_priorities must include {sorted(missing)}: critical and high "
+                "priority tasks are never downgraded automatically."
+            )
+        bad = set(self.degrade_limits) & set(self.no_degrade_priorities)
+        if bad:
+            raise ValueError(
+                f"degrade_limits cannot cover never-downgrade priorities {sorted(bad)}"
+            )
+        for k, v in self.degrade_limits.items():
+            if not 0 <= v <= 0.5:
+                raise ValueError(f"degrade limit for {k!r} must be in [0, 0.5]")
+        return self
 
     @field_validator("quality_floors")
     @classmethod

@@ -61,15 +61,20 @@ class Database:
         *,
         dataset_kind: DatasetKind,
         migrate: bool = True,
+        thread_bound: bool = True,
     ) -> Database:
         """Open (creating if needed) a database file and verify its dataset kind."""
         p = Path(path)
         if str(p) != ":memory:":
             p.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(p), isolation_level=None, timeout=5.0)
+        # thread_bound=False is only for worker connections: each is still used by exactly one
+        # worker thread, but the dispatcher may close it after that worker has exited.
+        conn = sqlite3.connect(
+            str(p), isolation_level=None, timeout=30.0, check_same_thread=thread_bound
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA busy_timeout = 30000")
         if str(p) != ":memory:":
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")

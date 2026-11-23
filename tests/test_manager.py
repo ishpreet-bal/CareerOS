@@ -8,7 +8,7 @@ from careeros.domain.models import ObjectiveStatus, TaskStatus
 from careeros.llm.adapters.scripted import ScriptedAdapter
 from careeros.manager.manager import ObjectiveRequest
 from careeros.manager.plans import Playbook, PlaybookLibrary, waves
-from careeros.simulation import ESCALATION_SCRIPT, SimulatedCrashError, run_scenario
+from careeros.simulation import ESCALATION_SCRIPT, SimulatedCrashError, later, run_scenario
 from tests.m2_helpers import DEMO, calls, decisions, manager, task_by_step
 
 
@@ -289,8 +289,9 @@ def test_interrupted_objective_resumes_without_duplicate_work(ctx: AppContext) -
     for step in ("research_company", "classify_role", "tailor_resume"):
         t = task_by_step(ctx, oid, step)
         assert len(calls(ctx, task_id=t["id"], purpose="task")) == 1, step
-    sessions = ctx.db.query("SELECT * FROM execution_sessions ORDER BY started_at")
-    assert len(sessions) == 2 and sessions[0]["ended_at"] is None  # first one crashed
+    sessions = ctx.db.query("SELECT * FROM execution_sessions ORDER BY rowid")
+    assert len(sessions) == 2
+    assert sessions[0]["end_reason"] == "presumed dead (recovered)"  # crashed, then taken over
 
 
 def test_crash_before_checkpoint_reroutes_without_losing_attempt_budget(ctx: AppContext) -> None:
@@ -305,7 +306,7 @@ def test_crash_before_checkpoint_reroutes_without_losing_attempt_budget(ctx: App
     oid = m.submit(DEMO)
     with pytest.raises(SimulatedCrashError):
         m.run(oid)
-    m2 = manager(ctx)
+    m2 = manager(ctx, clock=later(10))  # after the crashed session's leases expired
     assert m2.run(oid).status is ObjectiveStatus.DONE
     t = task_by_step(ctx, oid, "research_company")
     assert t["attempt"] == 1  # the interrupted attempt was resumed, not counted twice
@@ -404,4 +405,7 @@ def test_task_and_objective_budgets_tracked(ctx: AppContext) -> None:
 
 
 def test_escalation_script_is_the_documented_one() -> None:
-    assert ESCALATION_SCRIPT["job.classify_role@mock-small"] == ["malformed", "invalid"]
+    assert ESCALATION_SCRIPT["classify_role:job.classify_role@mock-small"] == [
+        "malformed",
+        "invalid",
+    ]

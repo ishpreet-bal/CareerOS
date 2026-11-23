@@ -3,10 +3,11 @@
 Local-first AI career intelligence and internship application agent.
 Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-**Current status: M0 + M1 + M2.** Configuration, storage and data models; the
-provider-neutral model layer with mock adapters; adaptive model/effort routing; simulated
-cost and budget controls; and the Career Manager (playbooks, planning, review, retries,
-escalation, approvals, recovery). All model calls are simulated.
+**Current status: M0–M3.** Configuration, storage and data models; the provider-neutral
+model layer with mock adapters; adaptive model/effort routing with a priority-based downgrade
+policy; simulated cost and budget controls; the Career Manager (playbooks, planning, review,
+retries, escalation, approvals); and bounded concurrent execution (default 3 workers) with
+atomic budget reservations and crash recovery. All model calls are simulated.
 
 ## Safety defaults
 
@@ -48,8 +49,9 @@ Run an offline demonstration (synthetic data, mock models, simulated costs):
 ```
 
 Scenarios: `standard`, `escalation`, `budget`, `interrupt`, `novel`. Related commands:
-`careeros approvals`, `careeros approve <id> --usd <simulated amount>`,
-`careeros resume <objective>`, `careeros report <objective>`.
+`careeros approvals`, `careeros approve <id> --usd <simulated amount>` (or
+`--accept-downgrade`), `careeros resume <objective>` (add `--force-recover` only when no other
+CareerOS process is running), `careeros report <objective>`.
 
 Use a throwaway location for experiments:
 

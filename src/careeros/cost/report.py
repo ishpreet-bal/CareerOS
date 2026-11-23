@@ -99,7 +99,9 @@ def build_report(db: Database, objective_id: int) -> CostReport:
                 acc_attempt, quality = r["attempt"], r["effective_confidence"]
         mine = [c for c in calls if c.task_id == t["id"]]
         cost = sum(c.cost_usd for c in mine)
-        wasted = sum(c.cost_usd for c in mine if c.attempt != acc_attempt)
+        wasted = sum(
+            c.cost_usd for c in mine if c.attempt != acc_attempt or c.status == "abandoned"
+        )
         tasks.append(
             TaskLine(
                 t["step"],
@@ -150,10 +152,14 @@ def build_report(db: Database, objective_id: int) -> CostReport:
             "estimated_cost_usd": est_total,
             "model_calls": len(calls),
             "cache_hits": sum(1 for c in calls if c.status == "cache_hit"),
+            "abandoned_calls": sum(1 for c in calls if c.status == "abandoned"),
             "tasks_succeeded": len(succeeded),
             "deterministic_tasks": sum(1 for t in tasks if t.mode == "deterministic"),
             "retries": sum(decisions.get(k, 0) for k in ("retry_same", "retry_with_feedback")),
             "escalations": sum(decisions.get(k, 0) for k in ("escalate_effort", "escalate_tier")),
+            "downgrades": decisions.get("degrade", 0),
+            "requeues": decisions.get("requeue", 0),
+            "recoveries": decisions.get("recover", 0),
             "cost_per_success_usd": per_success,
             "mean_accepted_quality": avg_q,
             "quality_adjusted_cost_per_success_usd": (
@@ -205,8 +211,11 @@ def format_report(rep: CostReport) -> str:
         f"{_usd(t['review_cost_usd'])} + planning {_usd(t['planning_cost_usd'])}",
         f"  estimated before calls {_usd(t['estimated_cost_usd'])}; budget {_usd(t['budget_usd'])}",
         f"  spent on failed/rejected attempts {_usd(t['wasted_cost_usd'])}",
-        f"  calls {t['model_calls']}, cache hits {t['cache_hits']}, retries {t['retries']}, "
+        f"  calls {t['model_calls']} (abandoned {t['abandoned_calls']}), cache hits "
+        f"{t['cache_hits']}, retries {t['retries']}, "
         f"escalations {t['escalations']}, deterministic steps {t['deterministic_tasks']}",
+        f"  downgrades {t['downgrades']}, budget requeues {t['requeues']}, "
+        f"recovered tasks {t['recoveries']}",
         f"  tasks succeeded {t['tasks_succeeded']}; cost per success "
         f"{_usd(t['cost_per_success_usd'])}; mean accepted quality "
         f"{'-' if t['mean_accepted_quality'] is None else f'{t["mean_accepted_quality"]:.2f}'}",

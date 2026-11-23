@@ -4,7 +4,7 @@
 execution:
   mode: mock               # mock | scripted. 'real' and 'manual' are rejected until approved.
   allow_real_models: false
-  max_concurrency: 4
+  max_concurrency: 3        # bounded worker threads per run
 
 storage:
   # Leave unset to use ~/.local/share/careeros/<dataset_kind>. Must be outside any git repo.
@@ -17,6 +17,7 @@ budgets:
   simulated_monthly_usd: 5.0
   default_objective_usd: 1.00
   default_task_usd: 0.25
+  session_simulated_usd: 2.00   # cap per run/resume invocation
 
 limits:
   max_attempts: 3

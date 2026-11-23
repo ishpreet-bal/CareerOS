@@ -36,9 +36,18 @@ class AppContext:
 
 def open_context(config: AppConfig) -> AppContext:
     """Open (creating if needed) the data directory and database for ``config``."""
-    data_dir = resolve_data_dir(config.storage)
+    return open_context_at(config, resolve_data_dir(config.storage))
+
+
+def open_context_at(config: AppConfig, data_dir: Path, *, thread_bound: bool = True) -> AppContext:
+    """Open a context on an already-resolved data directory.
+
+    Each call creates a *new* SQLite connection; concurrent workers each use their own.
+    """
     data_dir.mkdir(parents=True, exist_ok=True)
-    db = Database.open(data_dir / DB_FILENAME, dataset_kind=config.storage.dataset_kind)
+    db = Database.open(
+        data_dir / DB_FILENAME, dataset_kind=config.storage.dataset_kind, thread_bound=thread_bound
+    )
     blobs = LocalBlobStore(data_dir / "blobs")
     return AppContext(
         config=config,

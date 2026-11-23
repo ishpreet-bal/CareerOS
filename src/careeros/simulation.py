@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 
 from careeros.context import AppContext
-from careeros.core.errors import CareerOSError
+from careeros.core.clock import utc_now
+from careeros.core.errors import CareerOSError, SessionTerminatedError
 from careeros.domain.models import Task
 from careeros.llm.adapters.mock import MockAdapter
 from careeros.llm.adapters.scripted import ScriptedAdapter
@@ -25,18 +27,20 @@ SYNTHETIC_JOB = {
 }
 
 #: Forces a realistic sequence of failures so retry/escalation paths are visible.
+#: Keys are step-qualified so the script is deterministic under concurrent execution.
 ESCALATION_SCRIPT: dict[str, list[str]] = {
-    "research.company": ["timeout"],  # transient -> retry same model
-    "job.classify_role@mock-small": ["malformed", "invalid"],  # repair retry, then tier up
-    "resume.tailor": ["low_confidence"],  # -> raise reasoning effort
-    "quality.review": ["review:accept", "review:revise", "review:accept"],
+    "research_company:research.company": ["timeout"],  # transient -> retry same model
+    "classify_role:job.classify_role@mock-small": ["malformed", "invalid"],  # repair, tier up
+    "tailor_resume:resume.tailor": ["low_confidence"],  # -> raise reasoning effort
+    "tailor_resume:quality.review": ["review:accept"],
+    "draft_cover_letter:quality.review": ["review:revise", "review:accept"],
 }
 
 SCENARIOS = ("standard", "escalation", "budget", "interrupt", "novel")
 
 
-class SimulatedCrashError(CareerOSError):
-    """Stands in for a session being terminated mid-task."""
+class SimulatedCrashError(SessionTerminatedError):
+    """Stands in for the process being killed mid-task (all workers stop at once)."""
 
 
 @dataclass
@@ -47,9 +51,18 @@ class ScenarioResult:
 
 
 def _manager(
-    ctx: AppContext, adapter: ModelAdapter, fault: Callable[[str, Task], None] | None = None
+    ctx: AppContext,
+    adapter: ModelAdapter,
+    fault: Callable[[str, Task], None] | None = None,
+    clock: Callable[[], datetime] = utc_now,
 ) -> CareerManager:
-    return CareerManager(ctx, adapter=adapter, fault_hook=fault)
+    return CareerManager(ctx, adapter=adapter, fault_hook=fault, clock=clock)
+
+
+def later(minutes: float) -> Callable[[], datetime]:
+    """A clock running ``minutes`` ahead: simulates resuming after the crashed session's
+    leases have expired."""
+    return lambda: utc_now() + timedelta(minutes=minutes)
 
 
 def run_scenario(ctx: AppContext, name: str) -> ScenarioResult:
@@ -111,9 +124,12 @@ def run_scenario(ctx: AppContext, name: str) -> ScenarioResult:
             m1.run(oid)
         except SimulatedCrashError as exc:
             crash_events = [*m1.events, f"*** SESSION TERMINATED: {exc} ***"]
-        m2 = _manager(ctx, MockAdapter())  # a new session / process
+        # A new session / process, started after the dead session's leases expired.
+        m2 = _manager(ctx, MockAdapter(), clock=later(10))
         m2.run(oid)
-        return ScenarioResult(oid, [*crash_events, "*** NEW SESSION: resuming ***", *m2.events])
+        return ScenarioResult(
+            oid, [*crash_events, "*** NEW SESSION (10 min later): resuming ***", *m2.events]
+        )
 
     if name == "novel":
         m = _manager(ctx, MockAdapter())

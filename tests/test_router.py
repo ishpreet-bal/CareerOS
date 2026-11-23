@@ -129,14 +129,69 @@ def test_critical_task_over_budget_needs_approval_not_downgrade(ctx: AppContext)
     assert r.extra["needed_usd"] > 0.001
 
 
-def test_noncritical_task_over_budget_is_degraded_explicitly(ctx: AppContext) -> None:
-    cx = _cx(ctx.config, "job.analyze", complexity_hint=0.35)  # needs tier 1-2 for floor
+def test_normal_priority_downgrade_stays_within_limit(ctx: AppContext) -> None:
+    # complexity 0.65: tier 2 meets the 0.75 floor; tier 3 (p~0.67) is within the 0.10 limit
+    cx = _cx(ctx.config, "job.analyze", complexity_hint=0.30)
+    router = _router(ctx)
+    full = router.route("job.analyze", "normal", cx, 1.0)
+    assert full.status == "routed" and full.choice is not None and full.choice.tier == 2
+    tight = router.route("job.analyze", "normal", cx, full.choice.est_cost_usd * 0.5)
+    assert tight.status == "degraded" and tight.choice is not None
+    assert tight.quality_floor - 0.10 - 1e-9 <= tight.choice.p_accept < tight.quality_floor
+    assert tight.extra["degrade_floor"] == pytest.approx(0.65)
+
+
+def test_normal_priority_beyond_limit_asks_instead(ctx: AppContext) -> None:
+    cx = _cx(ctx.config, "job.analyze", complexity_hint=0.35)  # tier 3 p~0.6 < 0.65 limit
     full = _router(ctx).route("job.analyze", "normal", cx, 1.0)
     assert full.choice is not None
     tight = _router(ctx).route("job.analyze", "normal", cx, full.choice.est_cost_usd * 0.5)
-    assert tight.status == "degraded"
-    assert tight.choice is not None and tight.choice.p_accept < tight.quality_floor
-    assert "degraded" in tight.reason.lower()
+    assert tight.status == "needs_approval" and tight.choice is None
+    assert tight.extra["downgrade_option"]["model_id"] == "mock-small"
+
+
+@pytest.mark.parametrize("priority", ["high", "critical"])
+def test_high_and_critical_are_never_downgraded(ctx: AppContext, priority: str) -> None:
+    cx = _cx(ctx.config, "job.analyze", complexity_hint=0.30)
+    full = _router(ctx).route("job.analyze", priority, cx, 1.0)
+    assert full.choice is not None
+    tight = _router(ctx).route("job.analyze", priority, cx, full.choice.est_cost_usd * 0.5)
+    assert tight.status == "needs_approval" and tight.choice is None
+    assert "never downgraded automatically" in tight.reason
+
+
+def test_low_priority_optimizes_cost_but_respects_task_minimum(ctx: AppContext) -> None:
+    router = _router(ctx)
+    cx = _cx(ctx.config, "job.analyze", complexity_hint=0.15)
+    low = router.route("job.analyze", "low", cx, 1.0)
+    normal = router.route("job.analyze", "normal", cx, 1.0)
+    assert low.choice is not None and normal.choice is not None
+    assert low.choice.est_cost_usd <= normal.choice.est_cost_usd
+    # resume.tailor carries a factuality minimum of 0.80 even at low priority
+    floor, degrade_floor = router.floors("resume.tailor", "low")
+    assert floor >= 0.80 and degrade_floor is not None and degrade_floor >= 0.80
+
+
+def test_user_approved_downgrade_is_used_only_when_approved(ctx: AppContext) -> None:
+    cx = _cx(ctx.config, "job.analyze", complexity_hint=0.30)
+    router = _router(ctx)
+    full = router.route("job.analyze", "high", cx, 1.0)
+    assert full.choice is not None
+    budget = full.choice.est_cost_usd * 0.5
+    asked = router.route("job.analyze", "high", cx, budget)
+    option = asked.extra["downgrade_option"]
+    approved = router.route("job.analyze", "high", cx, budget, approved_floor=option["p_accept"])
+    assert approved.status == "approved_downgrade" and approved.choice is not None
+    assert approved.choice.model_id == option["model_id"]
+
+
+def test_policy_config_cannot_allow_downgrading_high_or_critical() -> None:
+    from careeros.core.config import RoutingConfig
+
+    with pytest.raises(ValueError, match="critical and high"):
+        RoutingConfig(no_degrade_priorities=("critical",))
+    with pytest.raises(ValueError, match="cannot cover"):
+        RoutingConfig(degrade_limits={"high": 0.1})
 
 
 def test_effort_escalation_keeps_model_and_raises_effort(ctx: AppContext) -> None:

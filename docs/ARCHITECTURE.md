@@ -1,6 +1,6 @@
 # CareerOS — Architecture & Implementation Plan (v3)
 
-Status: **APPROVED (with amendments in §0).** M0, M1 and M2 implemented; M3+ await approval.
+Status: **APPROVED (with amendments in §0).** M0–M3 implemented; M4+ await approval.
 Nothing is deployed, purchased or configured against a paid service.
 
 ---
@@ -19,6 +19,9 @@ These decisions override anything below that conflicts with them.
 | A6 | GitHub Actions CI runs within the free allowance. No paid CI. Session-based testing stays available. | §11, §13 (M0) |
 | A7 | **Resumable objectives.** The manager does not run continuously, but task execution, results, checkpoints and outstanding work persist and survive the end of any single execution session. | §7.3, §9.3 |
 | A8 | **M2 scope (2026-11-23):** M2 delivers the provider-neutral model layer, mock adapters, adaptive routing, cost and quality controls, *and* the Career Manager coordinator (playbooks, model-assisted planning, decomposition, review, decision table, approvals, recovery). Tasks run one at a time in M2; concurrent execution moves to M3. | §13, §15 |
+| A9 | **Priority and downgrade policy (2026-11-23):** critical and high-priority tasks are never downgraded automatically; if the floor cannot be met within budget the user is asked. Normal and low may be downgraded automatically within configured limits (`degrade_limits`), never below the task type's minimum quality (`min_quality`, e.g. factual deliverables) or `absolute_min_quality`. Every downgrade, automatic or user-approved, is recorded. Low priority optimizes for cost within its floor. | §5.4, §16.1 |
+| A10 | **M3 bounded concurrency (2026-11-23):** dependency-aware concurrent execution with a configurable worker limit (default 3), atomic budget reservations, exclusive task claims, idempotent model calls, lease-based recovery with multiple active workers. All model calls remain simulated. | §7, §16 |
+| A11 | **Storage stays offline-first (2026-11-23):** no external database, cloud storage, deployment or paid service. Keep a portable storage interface and document the path to durable storage. Synthetic data only. | §9.4, ADR 0005 |
 
 CareerOS is a standalone, local-first career intelligence and internship application agent.
 It shares no code, database, agents, infrastructure or modules with any other project. Ideas
@@ -299,10 +302,19 @@ choose argmin E_cost among feasible; tie-break by latency, then lower tier
 This picks the option with the lowest **expected cost to reach an acceptable result**, not the
 cheapest per call. A cheap model that fails 60% of the time often loses to a medium one.
 
-If no candidate is feasible:
-- for optional work → skip or defer it;
-- for critical work → `await_human` with a cost estimate ("needs ~$0.12 at Tier 1; approve?").
-  The system never silently downgrades quality on critical deliverables.
+If no candidate is feasible (amendment A9):
+
+| Priority | Floor cannot be met within budget |
+|---|---|
+| `critical`, `high` | Never downgraded automatically → `await_human` with the cost needed and, if one exists, the best affordable lower-quality option. The user may add budget **or** explicitly accept that downgrade. |
+| `normal` | Automatic downgrade allowed to at most `degrade_limits.normal` (default 0.10) below the floor; otherwise ask. |
+| `low` | Optimizes for cost within its floor; automatic downgrade allowed to at most `degrade_limits.low` (default 0.20) below; otherwise ask. |
+| every task | Never below `max(absolute_min_quality, task_type.min_quality)`; factual deliverables carry their own minimum (e.g. `resume.tailor: 0.80`). |
+
+Every downgrade — automatic or user-approved — is a `degrade` decision in the history with the
+floor, the chosen option and whether the user approved it; approvals are also rows in
+`approvals` (`quality_downgrade`). Config validation rejects removing `critical` or `high`
+from `no_degrade_priorities`.
 
 ### 5.5 Escalation ladder (bounded)
 
@@ -415,9 +427,9 @@ any non-terminal → CANCELLED | SKIPPED (by replan / done-met)
 ### 7.2 Execution
 
 - **DAG** in `tasks` + `task_dependencies` (`hard` = must succeed; `soft` = must finish, any outcome).
-- **Scheduler:** finds READY tasks (all hard dependencies succeeded) and runs them concurrently with `asyncio` and a semaphore (`max_concurrency`, default 4). Independent jobs and independent research run in parallel.
-- **SQLite in WAL mode.** Writes go through one connection or writer queue to avoid lock contention.
-- **Idempotency:** each task has an `idempotency_key`. Side-effecting steps (file writes) are idempotent, and model calls are cached.
+- **Dispatcher (M3):** `run` finds ready tasks (all prerequisites succeeded), claims each with one atomic conditional update, and executes up to `execution.max_concurrency` (default 3) at once on a bounded thread pool that exists only for that `run` call. Details in §16.
+- **SQLite in WAL mode.** Each worker thread has its own connection; every write is a short `BEGIN IMMEDIATE` transaction, so writers serialize safely and readers never block.
+- **Idempotency:** each task has an `idempotency_key`; each model request has an idempotency key (task, attempt, purpose); results are one row per (task, attempt).
 
 ### 7.3 Persistence and recovery (A7)
 
@@ -496,6 +508,33 @@ persistent store, the options are:
 1. Accept that cloud-session data is temporary (fine for synthetic development, M0–M5);
 2. Export an **encrypted** snapshot (`careeros snapshot --encrypt`, future) and keep the file yourself, outside GitHub;
 3. Later, pick a storage backend for `PersonalDataStore` (decision deferred; nothing paid is selected).
+
+### 9.4 Path to durable storage without rewriting orchestration (A11)
+
+Everything above the storage layer talks to two seams, so durability can be added later by
+replacing what is below them:
+
+| Seam | Used by | Current implementation |
+|---|---|---|
+| `core.db.Database` (+ repositories, `BudgetManager`, gateway ledger) | manager, router, gateway, workers | SQLite file in `data_dir`, WAL |
+| `storage.PersonalDataStore`, `storage.BlobStore` | profile, documents, applications | `SQLitePersonalStore`, `LocalBlobStore` |
+
+What any replacement backend must provide (the concurrency contract the orchestration relies
+on): serializable short write transactions; an atomic conditional update (task claims); unique
+constraints (idempotency keys, one result per attempt); and read-your-writes consistency.
+
+Options, cheapest first — none selected, none requires changing the manager:
+
+1. **Keep SQLite, make the file durable:** periodic `sqlite3` online backup (`VACUUM INTO`) to an
+   encrypted file the user stores themselves. No new dependency.
+2. **Keep SQLite, encrypt at rest:** an encrypted SQLite build or file-level encryption of the
+   backup; `Database.open` is the only place that changes.
+3. **A server database** (e.g. a self-hosted PostgreSQL) behind the same repositories. Needs a
+   small SQL-dialect layer (`BEGIN IMMEDIATE` → `SELECT … FOR UPDATE`/serializable
+   transactions, `json_valid` → JSON type, partial unique index syntax). Only if the user
+   approves a host; nothing paid is assumed.
+
+Until then the data is synthetic and temporary by design (ADR 0005).
 
 ---
 
@@ -882,7 +921,7 @@ one starts. All milestones through M9 run entirely on mock, scripted or manual a
 | **M0** | Scaffold | pyproject, package layout, ruff/mypy/pytest, `.gitignore` with personal-data patterns, README, ADR template, GitHub Actions CI | `pytest`, `ruff` and `mypy` pass locally; CI workflow is valid |
 | **M1** | Core and data | Typed config loader (models/routing/eligibility config templates, mock-only), storage abstraction (§9.2), SQLite + migration runner, full schema (§10), domain models and repositories, synthetic fixtures, `careeros init/status/config` | Schema created; repository round-trip tests pass; data dir can't be inside the repo; unknown work authorization is the default; task state survives closing and reopening the database |
 | **M2** | Model layer, routing, cost, Career Manager (A8) | Provider-neutral adapter protocol; `mock` and `scripted` adapters (capability, cost, latency, malformed/invalid/timeout/rate-limit/low-confidence outcomes); offline-only registry and per-call safety gate; gateway with token/cost ledger; hierarchical budgets with reservations; accepted-result cache; complexity estimator; quality-adjusted router with history; decision table; playbooks + model-assisted planning; independent review; replanning; approval requests; checkpoint-based recovery; cost/quality report; `demo/resume/report/approvals/approve` CLI | **Done.** 141 tests; real execution proven impossible (§15.6) |
-| **M3** | Concurrent orchestration | Execute independent tasks of a wave concurrently (bounded `max_concurrency`, per-provider rate limits), lease heartbeats and expiry-based recovery across concurrent workers, single-writer DB queue, wall-clock task timeouts | Parallel waves complete faster with identical results; killed workers' leases expire and are recovered |
+| **M3** | Bounded concurrent execution (A10) + priority policy (A9) | Dispatcher with bounded worker pool (default 3), atomic claims, per-thread connections, lease heartbeats, lease-based multi-worker recovery, atomic two-phase budget reservations (task/objective/session/month), idempotent model calls with in-flight/abandoned accounting, budget-contention requeue, worker-error retries, prerequisite failure/cancellation handling; downgrade policy with user-approved downgrades | **Done.** 174 tests incl. deterministic concurrency, contention, crash and recovery tests (§16) |
 | **M4** | Manager hardening and evaluation | Golden-set simulation harness with many seeded runs, routing-prior calibration report, exploration policy, richer definition-of-done checks, optional manual AI bridge (A5) | Calibration and cost/quality reports over ≥100 simulated objectives |
 | **M5** | Profile | Import profile from YAML/Markdown into `profile_facts`; writing samples; stylometric style profile; `careeros profile show/validate` | Your real profile loads; facts are citable; style vector is computed |
 | **M6** | Discovery and eligibility | **First: ADR verifying each source's current endpoints, rate limits and terms (A4).** Then Greenhouse/Lever/Ashby public board clients + manual URL/paste import; normalize, dedupe, filter; job analysis; configurable eligibility rules with `needs_user_confirmation` | Fixture-based tests pass; live fetch only after the ADR and the environment network allowlist are approved. No LinkedIn or Indeed scraping |
@@ -903,12 +942,9 @@ Still open (none blocks M0/M1):
 1. **Durable personal storage** (§9.3): how real profile data and task state should persist across cloud containers. Deferred; nothing selected.
 2. **Your eligibility inputs**: enter them yourself later through the CLI (M5). Until then every authorization is `unknown`.
 3. **Network allowlist for job-board hosts**: to be requested at M6 after the terms review.
-4. **Routing priors and quality floors** (`config/routing.yaml`) are starting guesses. They
-   are easy to tune and will be calibrated in M4; tell me if you want different floors per
-   priority, or `high` added to the never-downgrade list.
-5. **Concurrency (M3)**: whether parallel execution of independent tasks is worth the added
-   complexity now, given that model calls are simulated until real execution is approved.
-
+4. **Routing priors and quality floors** (`config/routing.yaml`) are starting guesses; resolved
+   policy (A9) is implemented. Calibration is planned for M4.
+5. **Durable storage** (§9.4): which of the documented options, if any, and when.
 
 ---
 
@@ -956,10 +992,11 @@ For every enabled `(model, effort)` allowed by the task type (`min_tier`,
 * `E` = expected cost to an accepted result: `E_i = c_i + (1−p_i)·min E_j over p_j > p_i`,
   and `E_top = c_top / p_top`.
 
-Choose min `E` among `p ≥ floor(priority)` and `c ≤ remaining budget` (task, objective and
-monthly, whichever is smallest). Otherwise: priorities in `no_degrade_priorities`
-(default `critical`) → `needs_approval`; other priorities → explicitly recorded `degraded`
-choice if anything is affordable, else `needs_approval`. Retries reuse the model; effort
+Choose min `E` among `p ≥ floor(priority)` and `c ≤ remaining budget` (task, objective,
+session and monthly, whichever is smallest; committed spend only — concurrent reservations are
+enforced at reservation time, §16.3). Otherwise the A9 policy applies (§5.4): critical/high →
+`needs_approval` (with a downgrade option the user may accept); normal/low → recorded
+`degraded` choice within `degrade_limits`, else `needs_approval`. Retries reuse the model; effort
 escalation keeps the model and raises effort; tier escalation requires a stronger tier.
 
 ### 15.4 Manager loop
@@ -992,3 +1029,95 @@ the model response, so completed work is neither repeated nor re-billed.
 5. No module imports a network library or vendor SDK (AST test); full scenarios pass with
    sockets disabled; API keys in the environment are ignored.
 6. The database rejects any non-real call recorded as non-simulated cost.
+
+---
+
+## 16. M3 implementation notes — bounded concurrent execution
+
+### 16.1 Files
+
+| File | Change |
+|---|---|
+| `manager/manager.py` | `run` is a dispatcher with a bounded `ThreadPoolExecutor`; `_claim`, `_heartbeat`, `_recover` (lease-based), `_worker_failed`, `_requeue`, `_ready_tasks`; workers run `_execute_claimed` on their own connection; halting on session termination; downgrade approval |
+| `llm/gateway.py` | Two-phase call (T1 reserve + in-flight row, T2 complete + settle); idempotency-key replay; `abandon_in_flight` |
+| `cost/budget.py` | Reservation rows owned by sessions; `reserve_in`/`settle_in`/`release_in` inside caller transactions; session budget level; committed-only availability for routing |
+| `routing/router.py` | A9 priority policy: `floors`, `degrade_limits`, `min_quality`, `approved_floor`, `approved_downgrade` status, downgrade option offered to the user |
+| `llm/adapters/scripted.py` | Thread-safe; step-qualified script keys |
+| `core/config.py`, `config/*.yaml` | `max_concurrency` default 3; `session_simulated_usd`; `heartbeat_seconds`; policy fields and validation |
+| `core/db.py`, `context.py` | 30 s busy timeout; per-thread worker connections |
+| `migrations/0003_m3_concurrency.sql` | `budget_reservations`; `model_calls.session_id/idempotency_key/reservation_id/response_json`; `tasks.approved_floor`; extended decision/approval/budget kinds |
+
+### 16.2 Concurrency, dependencies and the worker limit
+
+* A `run` call is one **execution session**. Its dispatcher loop: read state → find ready
+  tasks (pending/ready/retry-scheduled whose prerequisites all *succeeded*, in wave order) →
+  **claim** each with `UPDATE tasks SET status='running', attempt=attempt+1, lease_owner=? …
+  WHERE id=? AND status IN (runnable)`; only a claim that changed one row runs → submit to a
+  `ThreadPoolExecutor(max_workers=execution.max_concurrency)` → wait for the first completion →
+  repeat. At most `max_concurrency` tasks are in flight; the pool is shut down when `run`
+  returns, so no worker outlives the call.
+* Each worker thread gets its own `CareerManager` clone on its **own SQLite connection**; the
+  adapter, worker registry, playbooks and event log are shared (thread-safe).
+* A task whose prerequisite **failed, was skipped or was cancelled** is marked `skipped` (with a
+  `skip` decision) and its own dependents follow. A **replan** prunes dependents *before* the
+  parent is marked succeeded, so a dependent can never be dispatched in between.
+* When the **definition of done** is met, the dispatcher stops claiming, waits for in-flight
+  tasks, then cancels unstarted optional work.
+* An unexpected **worker exception** affects only that task: its held reservations are
+  released and it is retried (`worker_error` decision) until `max_attempts`, then `failed`.
+
+### 16.3 Budget reservations and database consistency
+
+* **Atomic reservation.** In one `BEGIN IMMEDIATE` transaction (T1) the gateway checks every
+  budget level (month, session, objective, task: `limit − spent − reserved ≥ estimate`),
+  increments `reserved_usd` on all of them, inserts the `budget_reservations` row and inserts
+  the `in_flight` call row. SQLite's write lock makes this one step across all threads and
+  processes, so concurrent tasks can never jointly exceed any level.
+* **Atomic settlement.** In T2 the call row is completed (tokens, latency, cost, stored
+  response) and the reservation is converted to spend in the same transaction.
+* **Routing vs. reservation.** The router sizes its choice against *committed* spend; if a
+  concurrent task's reservation makes the reservation fail although committed spend would
+  allow it, the task is **requeued** (`requeue` decision) and retried once a running task
+  settles — contention never triggers a downgrade or an approval request.
+* **Duplicate prevention.** Exclusive claims (one executor per attempt); a unique idempotency
+  key per model request (`task:<id>:attempt:<n>`, `review:…`, `plan:…`) — a repeated request
+  returns the stored reply instead of calling the adapter; one result row per (task, attempt);
+  a resumed review replaces rather than duplicates its review row.
+* **Writes.** Short transactions only; WAL; 30 s busy timeout; checkpoints are written right
+  after each model reply.
+
+### 16.4 Interruption and recovery with several active workers
+
+* A live session renews its leases every `heartbeat_seconds` (default `lease_seconds / 3`).
+* If the process dies (simulated by `SessionTerminatedError` from any worker), the dispatcher
+  sets a halt flag; every other worker stops at its next step; nothing is cleaned up — state is
+  exactly what a kill leaves: running tasks with leases, possibly an `in_flight` call with a
+  held reservation.
+* The next `run` (any process) calls `_recover` first:
+  * a session is **dead** if it ended or its heartbeat is older than one lease
+    (`--force-recover` declares all other sessions dead);
+  * its `in_flight` calls become `abandoned`, charged at their **estimate** (the provider may
+    have billed them — conservative), and their reservations are settled;
+  * its other held reservations are released;
+  * tasks it was running whose lease expired return to `ready` **at the same attempt number**
+    (`recover` decision); the checkpoint or the idempotent call record supplies any reply that
+    already arrived, so it is neither repeated nor re-billed;
+  * tasks held by a **live** session are left alone.
+
+### 16.5 Remaining concerns and limitations
+
+1. **Abandoned calls can be repeated.** If the process dies while a call is in flight, the
+   replacement call is a second call; it is charged conservatively. With real providers this
+   could mean paying twice for that one request; unavoidable without provider-side idempotency.
+2. **Threads, not processes.** Model calls are I/O-bound, so threads suffice; CPU-heavy
+   deterministic workers would serialize on the GIL. Several *processes* may run the same
+   objective safely (claims and reservations are database-level), but there is no supervisor.
+3. **Clock-based liveness.** A session that hangs (alive but stuck) keeps its leases fresh only
+   while its heartbeat thread runs; a stopped heartbeat makes it look dead after one lease.
+   `--force-recover` must only be used when no other process is running.
+4. **SQLite write throughput** bounds concurrency in practice (fine at 3–16 workers).
+5. **Determinism.** Per-task outcomes are deterministic (seeded per request, step-keyed
+   scripts); the *interleaving* of the event log is not, and it does not need to be.
+6. **Session budgets** reset with each `run` invocation; the monthly simulated cap still
+   bounds total spend.
+
