@@ -373,6 +373,8 @@ class Task(_Model):
     spent_usd: float = Field(default=0.0, ge=0)
     accepted_result_id: int | None = None
     last_error: str | None = None
+    #: ``step`` (a plan step) or ``planning`` (the owned task that produces the plan).
+    kind: str = "step"
 
 
 class Evidence(_Model):

@@ -10,7 +10,13 @@ import pytest
 
 import careeros.core.db as dbmod
 from careeros.core.db import Database
+
+# The newest schema version bundled with this build (bumped by each migration).
+from careeros.core.db import load_migrations as _load_migrations
 from careeros.orchestration.fencing import claim
+
+LATEST = max(m.version for m in _load_migrations())
+
 
 NOW = "2026-11-20T10:00:00+00:00"
 LATER = "2026-11-20T11:00:00+00:00"
@@ -140,7 +146,7 @@ def test_backfill_preserves_open_attempts(tmp_path: Path, monkeypatch: pytest.Mo
     path = tmp_path / "v4.db"
     ids = _v4_database(path, monkeypatch)
     with Database.open(path, dataset_kind="synthetic") as db:
-        assert db.schema_version() == 5
+        assert db.schema_version() == LATEST
         for step, (_, _old, _, _, (exp_attempt, exp_open)) in CASES.items():
             r = db.query_one(
                 "SELECT attempt, attempt_open, owner_generation FROM tasks WHERE id=?", (ids[step],)

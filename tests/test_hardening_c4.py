@@ -34,6 +34,9 @@ from careeros.core.backup import (
 )
 from careeros.core.config import AppConfig, ModelProfile
 from careeros.core.db import DB_FILENAME, Database
+
+# The newest schema version bundled with this build (bumped by each migration).
+from careeros.core.db import load_migrations as _load_migrations
 from careeros.core.errors import DurabilityError
 from careeros.domain.models import ObjectiveStatus
 from careeros.llm.adapters.mock import MockAdapter
@@ -47,6 +50,9 @@ from tests.conftest import CONFIG_DIR
 from tests.m2_helpers import calls, task_by_step
 from tests.m3_helpers import book, model_step
 from tests.phase_b_helpers import ledger_consistent
+
+LATEST = max(m.version for m in _load_migrations())
+
 
 SPAWN = mp.get_context("spawn")
 FULL = {"journal_mode": "wal", "synchronous": "FULL", "synchronous_level": 2, "fullfsync": True}
@@ -231,7 +237,7 @@ def test_backup_while_in_use_is_consistent_and_does_not_disturb_workers(
         w.join(10)
     assert writes[0] > 0
     for b in backups:
-        assert b.ok and b.schema_version == 5 and b.dataset_kind == "synthetic"
+        assert b.ok and b.schema_version == LATEST and b.dataset_kind == "synthetic"
         assert verify_backup(b.path).ok
         _invariants(b.path, oid)
         conn = sqlite3.connect(str(b.path))

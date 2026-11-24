@@ -311,27 +311,32 @@ class OrchestrationRepository:
         )
 
     def create_objective(self, obj: Objective) -> Objective:
-        now = utc_now_iso()
         with self.db.transaction() as c:
-            cur = c.execute(
-                "INSERT INTO objectives (kind, title, inputs, definition_of_done, priority,"
-                " budget_usd, budget_tokens, status, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (
-                    obj.kind,
-                    obj.title,
-                    to_json(obj.inputs),
-                    to_json(obj.definition_of_done),
-                    obj.priority.value,
-                    obj.budget_usd,
-                    obj.budget_tokens,
-                    obj.status.value,
-                    now,
-                    now,
-                ),
-            )
+            oid = self.create_objective_in(c, obj)
+        return self.get_objective(oid)
+
+    @staticmethod
+    def create_objective_in(c: sqlite3.Connection, obj: Objective) -> int:
+        now = utc_now_iso()
+        cur = c.execute(
+            "INSERT INTO objectives (kind, title, inputs, definition_of_done, priority,"
+            " budget_usd, budget_tokens, status, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                obj.kind,
+                obj.title,
+                to_json(obj.inputs),
+                to_json(obj.definition_of_done),
+                obj.priority.value,
+                obj.budget_usd,
+                obj.budget_tokens,
+                obj.status.value,
+                now,
+                now,
+            ),
+        )
         assert cur.lastrowid is not None
-        return self.get_objective(cur.lastrowid)
+        return int(cur.lastrowid)
 
     def get_objective(self, objective_id: int) -> Objective:
         r = self.db.query_one("SELECT * FROM objectives WHERE id=?", (objective_id,))
@@ -381,22 +386,28 @@ class OrchestrationRepository:
     # ---------------------------------------------------------------- plans
     def create_plan(self, plan: Plan) -> Plan:
         """Create the next plan version; any previous active version is superseded."""
-        now = utc_now_iso()
         with self.db.transaction() as c:
-            row = c.execute(
-                "SELECT COALESCE(MAX(version), 0) AS v FROM plans WHERE objective_id=?",
-                (plan.objective_id,),
-            ).fetchone()
-            version = int(row["v"]) + 1
-            c.execute(
-                "UPDATE plans SET superseded_at=? WHERE objective_id=? AND superseded_at IS NULL",
-                (now, plan.objective_id),
-            )
-            cur = c.execute(
-                "INSERT INTO plans (objective_id, version, source, rationale, graph, created_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (plan.objective_id, version, plan.source, plan.rationale, to_json(plan.graph), now),
-            )
+            return self.create_plan_in(c, plan)
+
+    @staticmethod
+    def create_plan_in(c: sqlite3.Connection, plan: Plan) -> Plan:
+        """Inside the caller's transaction: supersede the current version (if any) and
+        insert the next one. A unique index allows one current plan per objective."""
+        now = utc_now_iso()
+        row = c.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM plans WHERE objective_id=?",
+            (plan.objective_id,),
+        ).fetchone()
+        version = int(row["v"]) + 1
+        c.execute(
+            "UPDATE plans SET superseded_at=? WHERE objective_id=? AND superseded_at IS NULL",
+            (now, plan.objective_id),
+        )
+        cur = c.execute(
+            "INSERT INTO plans (objective_id, version, source, rationale, graph, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (plan.objective_id, version, plan.source, plan.rationale, to_json(plan.graph), now),
+        )
         return plan.model_copy(update={"id": cur.lastrowid, "version": version})
 
     def skip_steps(
@@ -454,6 +465,12 @@ class OrchestrationRepository:
             "INSERT INTO plans (objective_id, version, source, rationale, graph, created_at)"
             " VALUES (?,?,?,?,?,?)",
             (objective_id, version, cur_plan["source"], rationale, to_json(graph), now),
+        )
+        # The new version carries every task of the previous one (finding N5: tasks are
+        # explicitly associated with the current plan version; the claim checks it).
+        c.execute(
+            "UPDATE tasks SET plan_id=? WHERE objective_id=? AND plan_id=?",
+            (ins.lastrowid, objective_id, cur_plan["id"]),
         )
         plan = Plan(
             id=ins.lastrowid,
@@ -544,7 +561,7 @@ class OrchestrationRepository:
         "objective_id, plan_id, parent_task_id, worker, step, task_type, title, input,"
         " acceptance_criteria, priority, important, complexity, status, attempt, max_attempts,"
         " escalations, current_tier, current_effort, idempotency_key, budget_usd, spent_usd,"
-        " created_at, updated_at"
+        " created_at, updated_at, kind"
     )
 
     @staticmethod
@@ -577,16 +594,24 @@ class OrchestrationRepository:
             spent_usd=r["spent_usd"],
             accepted_result_id=r["accepted_result_id"],
             last_error=r["last_error"],
+            kind=r["kind"] if "kind" in r.keys() else "step",  # noqa: SIM118 - sqlite3.Row
         )
 
     def add_task(self, task: Task) -> Task:
         """Insert a task. If its idempotency key already exists, return the existing task."""
+        with self.db.transaction() as c:
+            tid = self.add_task_in(c, task)
+        return self.get_task(tid)
+
+    @classmethod
+    def add_task_in(cls, c: sqlite3.Connection, task: Task) -> int:
+        """Inside the caller's transaction; returns the (existing or new) task id."""
         if task.idempotency_key is not None:
-            r = self.db.query_one(
-                "SELECT * FROM tasks WHERE idempotency_key=?", (task.idempotency_key,)
-            )
+            r = c.execute(
+                "SELECT id FROM tasks WHERE idempotency_key=?", (task.idempotency_key,)
+            ).fetchone()
             if r is not None:
-                return self._row_task(r)
+                return int(r["id"])
         now = utc_now_iso()
         values: tuple[Any, ...] = (
             task.objective_id,
@@ -612,15 +637,15 @@ class OrchestrationRepository:
             task.spent_usd,
             now,
             now,
+            task.kind,
         )
         placeholders = ",".join("?" * len(values))
-        with self.db.transaction() as c:
-            cur = c.execute(
-                f"INSERT INTO tasks ({self._TASK_COLUMNS}) VALUES ({placeholders})",  # noqa: S608
-                values,
-            )
+        cur = c.execute(
+            f"INSERT INTO tasks ({cls._TASK_COLUMNS}) VALUES ({placeholders})",  # noqa: S608
+            values,
+        )
         assert cur.lastrowid is not None
-        return self.get_task(cur.lastrowid)
+        return int(cur.lastrowid)
 
     def get_task(self, task_id: int) -> Task:
         r = self.db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
@@ -656,11 +681,20 @@ class OrchestrationRepository:
         self, task_id: int, depends_on: int, kind: DependencyKind = DependencyKind.HARD
     ) -> None:
         with self.db.transaction() as c:
-            c.execute(
-                "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id, kind)"
-                " VALUES (?,?,?)",
-                (task_id, depends_on, kind.value),
-            )
+            self.add_dependency_in(c, task_id, depends_on, kind)
+
+    @staticmethod
+    def add_dependency_in(
+        c: sqlite3.Connection,
+        task_id: int,
+        depends_on: int,
+        kind: DependencyKind = DependencyKind.HARD,
+    ) -> None:
+        c.execute(
+            "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id, kind)"
+            " VALUES (?,?,?)",
+            (task_id, depends_on, kind.value),
+        )
 
     def dependencies(self, task_id: int) -> list[tuple[int, DependencyKind]]:
         rows = self.db.query(

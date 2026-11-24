@@ -13,9 +13,9 @@ fails on the baseline passes after the change, and CI is green on the fixing com
 | N6 | Hot, unbounded claim/requeue loop for a lone task under budget contention (found during C2) | C2 | **Fixed** in C2 |
 | L7 | Ctrl-C does not stop workers; no SIGTERM handling | C3 | **Fixed** in C3 (evidence below) |
 | L8 | `synchronous=NORMAL` | C4 | **Fixed** in C4 (evidence below) |
-| L9 | Planning has no heartbeat, ownership or resume (reproduced) | C5 | Open |
-| N3 | Approving a planning clarification does not re-plan | C5 | Open |
-| N5 | Partial plan installation (found during C1) | C5 | Open — requirements below |
+| L9 | Planning has no heartbeat, ownership or resume (reproduced) | C5 | **Fixed** in C5 (evidence below) |
+| N3 | Approving a planning clarification does not re-plan | C5 | **Fixed** in C5 |
+| N5 | Partial plan installation (found during C1) | C5 | **Fixed** in C5 (all five requirements below) |
 | L12 | Approvals have no expiry or caps | C6 | Open |
 | L11 | No factual-accuracy policy | C7 | Open |
 | N4 | Cached accepted results skip review (factual policy version) | C7 | Open |
@@ -119,6 +119,42 @@ a destination inside the git repository.
 
 Verification: full suite 596 passed; `ruff check`, `ruff format --check`, `mypy` clean;
 coverage 96% (`core/backup.py` 93%: uncovered lines are defensive error branches).
+
+## C5 evidence
+
+`tests/test_hardening_c5_baseline.py` (public behaviour only; runs on any version) - all
+four fail on the baseline (`f1d954d`) and pass after C5:
+
+| Finding | Test | Baseline behaviour observed |
+|---|---|---|
+| L9 | `test_crash_during_planning_is_recovered_not_failed` | resume marked the objective failed ("no runnable work") |
+| L9 | `test_slow_planning_is_not_mistaken_for_a_dead_session` | another session abandoned (and charged) the planning call |
+| N3 | `test_answering_a_clarification_leads_to_a_plan` | after the clarification was approved the objective failed with no plan |
+| N5 | `test_a_step_never_runs_before_its_prerequisite_when_dependency_rows_are_missing` | step b started while a was still unfinished (`retry_scheduled`) |
+
+`tests/test_hardening_c5.py` (uses the new APIs): planning as an owned task; planning
+longer than a lease kept alive by the heartbeat; failed heartbeat halts planning and
+recovery replays the call; stale planner cannot install; graceful shutdown during planning;
+crash inside installation leaves the previous valid plan; a failed playbook submission
+leaves nothing; missing dependency rows and missing task rows; tasks of an outdated
+version; the planning task cannot run after installation; one current plan enforced by the
+database; clarification answer resumes planning; repeated clarification and interrupted
+replanning; separate processes: planner killed in the call, after settlement and inside
+installation, then recovered without duplicate billing; heartbeat failure in a planner
+process; four concurrent planner processes install one plan; migration backfill (one
+current plan, re-association, dependency rows, new columns, idempotent) and legacy
+objectives without a plan, including an answered legacy clarification.
+
+N5 requirements: (1) atomic installation - `_install_plan_in`, one transaction, with the
+objective for playbooks; (2) never executable when partial - atomicity, plus claim-time
+dependency completeness for older data; (3) explicit task-to-plan-version association -
+`tasks.plan_id` kept current by installs and prunes, migrated; (4) claim-time membership of
+the current version - `CLAIMABLE_SQL`, shared with the dispatcher; (5) crash recovery -
+installs roll back entirely; planning resumes by key; `_ensure_plan` completes older
+partial installs; migration 0006 backfills.
+
+Verification: full suite 621 passed; `ruff check`, `ruff format --check`, `mypy` clean;
+coverage 96% (fencing 100%, repositories 96%, manager 94%).
 
 ## N5 — requirements carried into C5
 

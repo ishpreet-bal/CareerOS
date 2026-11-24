@@ -53,7 +53,9 @@ def test_unfamiliar_objective_gets_model_assisted_plan(ctx: AppContext) -> None:
     plan = ctx.orchestration.current_plan(oid)
     assert plan is not None and plan.source == "model"
     [planning] = calls(ctx, purpose="planning")
-    assert planning["tier"] == 1 and planning["task_id"] is None
+    # Planning is an owned task (C5, audit L9): its calls belong to the planning task.
+    task = ctx.db.query_one("SELECT * FROM tasks WHERE objective_id=? AND kind='planning'", (oid,))
+    assert planning["tier"] == 1 and task is not None and planning["task_id"] == task["id"]
     assert m.run(oid).status is ObjectiveStatus.DONE
 
 

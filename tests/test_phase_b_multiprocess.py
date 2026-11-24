@@ -13,6 +13,9 @@ from typing import Any
 import pytest
 
 from careeros.context import AppContext
+
+# The newest schema version bundled with this build (bumped by each migration).
+from careeros.core.db import load_migrations as _load_migrations
 from careeros.core.errors import SessionTerminatedError
 from careeros.domain.models import TaskStatus
 from careeros.manager.manager import CareerManager
@@ -22,6 +25,9 @@ from tests import mp_workers
 from tests.m2_helpers import calls, decisions, task_by_step
 from tests.m3_helpers import GatedAdapter
 from tests.phase_b_helpers import done, ledger_consistent, submit
+
+LATEST = max(m.version for m in _load_migrations())
+
 
 SPAWN = mp.get_context("spawn")
 ONE: dict[str, Any] = {
@@ -293,4 +299,4 @@ def test_concurrent_first_time_initialisation_from_processes(tmp_path: Any) -> N
         procs = [_start(mp_workers.open_fresh, str(path), barrier, q) for _ in range(n)]
         results = _collect(q, n)
         _join(*procs)
-        assert {(r["version"], r["kind"]) for r in results} == {(5, "synthetic")}
+        assert {(r["version"], r["kind"]) for r in results} == {(LATEST, "synthetic")}

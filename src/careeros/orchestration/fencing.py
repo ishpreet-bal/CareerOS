@@ -48,15 +48,31 @@ def check_fence(c: sqlite3.Connection, fence: Fence, now_iso: str) -> None:
         )
 
 
-#: The claim-time readiness rule (audit L10), as a condition on a ``tasks`` row. It
-#: mirrors the dispatcher (``CareerManager._ready_tasks``) so a claim can never run work
-#: that a stale readiness snapshot let through: the task is runnable, its objective is
-#: active, and every prerequisite (hard or soft, as the dispatcher treats them) has
-#: succeeded. Static SQL; the id is the only parameter.
+#: The claim-time readiness rule (audit L10, finding N5), as a condition on a ``tasks``
+#: row. The dispatcher (``CareerManager._ready_tasks``) selects with the same condition,
+#: so a claim can never run work a stale readiness snapshot let through. A task is
+#: claimable only if:
+#:
+#: * it is runnable and its objective is active;
+#: * it belongs to the objective's **current** plan version (a task of a superseded plan -
+#:   including a planning task once a plan is installed - can never run);
+#: * its dependency rows are **complete**: every prerequisite its plan's graph lists for
+#:   its step has a dependency row (a partially installed plan cannot run early);
+#: * every prerequisite (hard or soft, as the dispatcher treats them) has succeeded.
+#:
+#: Static SQL; the id is the only parameter.
 CLAIMABLE_SQL = (
     "status IN ('pending','ready','retry_scheduled')"
     " AND EXISTS (SELECT 1 FROM objectives o WHERE o.id = tasks.objective_id"
     "   AND o.status = 'active')"
+    " AND plan_id = (SELECT cp.id FROM plans cp WHERE cp.objective_id = tasks.objective_id"
+    "   AND cp.superseded_at IS NULL)"
+    " AND NOT EXISTS (SELECT 1 FROM plans gp, json_each(gp.graph, '$.steps') gs,"
+    "   json_each(gs.value, '$.depends_on') gd"
+    "   WHERE gp.id = tasks.plan_id AND json_extract(gs.value, '$.id') = tasks.step"
+    "   AND NOT EXISTS (SELECT 1 FROM task_dependencies td JOIN tasks dt"
+    "     ON dt.id = td.depends_on_task_id WHERE td.task_id = tasks.id"
+    "     AND dt.step = gd.value))"
     " AND NOT EXISTS (SELECT 1 FROM task_dependencies d JOIN tasks p"
     "   ON p.id = d.depends_on_task_id WHERE d.task_id = tasks.id"
     "   AND p.status <> 'succeeded')"

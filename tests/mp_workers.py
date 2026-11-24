@@ -504,3 +504,107 @@ def crash_at(data_dir: str, objective_id: int, book: dict[str, Any], point: str,
             _report(out, status="finished-without-crashing")
     except BaseException:
         _report(out, error=traceback.format_exc())
+
+
+def _plan_hold_adapter(entered: Any, release: Any, timeout: float) -> Any:
+    """The first planning call blocks inside the 'provider' until ``release``."""
+    from careeros.llm.adapters.mock import MockAdapter
+
+    class PlanHold(MockAdapter):
+        mode_label: ClassVar[str] = "mock"
+        held = False
+
+        def call(self, profile: Any, request: Any) -> Any:
+            if request.task_type == "manager.plan_novel" and not self.held:
+                self.held = True
+                entered.set()
+                release.wait(timeout)
+            return super().call(profile, request)
+
+    return PlanHold()
+
+
+def plan_with_hold(
+    data_dir: str,
+    objective_id: int,
+    entered: Any,
+    release: Any,
+    out: Any,
+    limits: dict[str, Any] | None = None,
+    fail_renewals: bool = False,
+    timeout: float = 30.0,
+) -> None:
+    """Run the objective's planning phase; its first planning call blocks."""
+    try:
+        if fail_renewals:
+            from careeros.manager.manager import CareerManager
+
+            CareerManager._renew_leases = lambda self, db, s, st: False  # type: ignore[method-assign]
+        with _ctx(data_dir, limits) as c:
+            m = _manager(c, None, adapter=_plan_hold_adapter(entered, release, timeout))
+            s = m.run(objective_id, planning_only=True)
+            _report(out, stop_reason=s.stop_reason, lease_lost=m._lease_lost.is_set())
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+#: Crash points of a planner process.
+PLAN_CRASH_POINTS = ("in_call", "before_install", "mid_install")
+
+
+def plan_and_die(data_dir: str, objective_id: int, point: str, out: Any) -> None:
+    """Run planning and kill the process (``os._exit``) at ``point``:
+
+    * ``in_call`` - the provider replied, before T2 (the call stays in flight);
+    * ``before_install`` - T2 committed (call settled), before the plan is installed;
+    * ``mid_install`` - inside the installing transaction, after some tasks were written.
+    """
+    try:
+        from careeros.domain.repositories import OrchestrationRepository
+        from careeros.llm.adapters.mock import MockAdapter
+        from careeros.manager.manager import CareerManager
+
+        def die() -> None:
+            _report(out, died_at=point)
+            time.sleep(0.2)
+            os._exit(17)
+
+        class Dying(MockAdapter):
+            mode_label: ClassVar[str] = "mock"
+
+            def call(self, profile: Any, request: Any) -> Any:
+                reply = super().call(profile, request)
+                if point == "in_call" and request.task_type == "manager.plan_novel":
+                    die()
+                return reply
+
+        if point == "before_install":
+            CareerManager._install_plan_in = lambda self, *a, **k: die()  # type: ignore[method-assign]
+        if point == "mid_install":
+            orig = OrchestrationRepository.add_task_in.__func__  # type: ignore[attr-defined]
+            count = [0]
+
+            def add_task_in(cls: Any, c: Any, task: Any) -> int:
+                count[0] += 1
+                if count[0] == 2:
+                    die()  # the transaction is open: everything so far must roll back
+                return int(orig(cls, c, task))
+
+            OrchestrationRepository.add_task_in = classmethod(add_task_in)  # type: ignore[method-assign,assignment]
+        with _ctx(data_dir) as c:
+            _manager(c, None, adapter=Dying()).run(objective_id, planning_only=True)
+            _report(out, status="finished-without-dying")
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def plan_concurrently(data_dir: str, objective_id: int, barrier: Any, out: Any) -> None:
+    """Several planner processes start the same objective's planning at once."""
+    try:
+        with _ctx(data_dir) as c:
+            m = _manager(c, None)
+            barrier.wait(30)
+            s = m.run(objective_id, planning_only=True)
+            _report(out, stop_reason=s.stop_reason, dispatches=s.dispatches)
+    except BaseException:
+        _report(out, error=traceback.format_exc())

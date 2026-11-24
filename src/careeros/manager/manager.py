@@ -67,7 +67,7 @@ from careeros.manager.plans import (
     parse_plan,
     waves,
 )
-from careeros.orchestration.fencing import Fence, check_fence, claim
+from careeros.orchestration.fencing import CLAIMABLE_SQL, Fence, check_fence, claim
 from careeros.routing.complexity import estimate_complexity
 from careeros.routing.router import Candidate, Escalation, RouteDecision, Router
 from careeros.routing.stats import RoutingStatsRepository
@@ -244,33 +244,36 @@ class CareerManager:
                 else self.config.budgets.default_objective_usd
             )
         )
-        obj = self.repo.create_objective(
-            Objective(
-                kind=playbook.name if playbook else (req.kind or "novel"),
-                title=req.title,
-                inputs=req.inputs,
-                definition_of_done=(
-                    playbook.definition_of_done if playbook else ["accepted:all_required"]
-                ),
-                priority=Priority(priority),
-                budget_usd=budget,
-            )
+        draft = Objective(
+            kind=playbook.name if playbook else (req.kind or "novel"),
+            title=req.title,
+            inputs=req.inputs,
+            definition_of_done=(
+                playbook.definition_of_done if playbook else ["accepted:all_required"]
+            ),
+            priority=Priority(priority),
+            budget_usd=budget,
         )
+        # The objective and its plan (playbook) or planning phase are created in one
+        # transaction: an objective never exists without either (finding N5).
+        with self.db.transaction() as c:
+            obj = draft.model_copy(update={"id": self.repo.create_objective_in(c, draft)})
+            if playbook is not None:
+                plan = self._install_plan_in(
+                    c, obj, playbook.plan, source=f"playbook:{playbook.name}", rationale=why
+                )
+            else:
+                # Planning is an owned, recoverable phase (audit L9): a planning task under a
+                # planning-phase plan version, executed like any task (claim, lease,
+                # heartbeat, fenced writes, idempotent calls, recovery, graceful shutdown).
+                self._start_planning_in(c, obj, why)
         assert obj.id is not None
         self._log(f"Objective {obj.id}: {req.title!r} ({why})")
         if playbook is not None:
-            self._install_plan(
-                obj, playbook.plan, source=f"playbook:{playbook.name}", rationale=why
-            )
+            self._log_plan(plan, playbook.plan, f"playbook:{playbook.name}")
         else:
-            session = self.repo.start_session()
-            try:
-                plan = self._model_assisted_plan(obj, why, session)
-            finally:
-                self.repo.end_session(session, "planning finished")
-            if plan is None:
-                return obj.id
-            self._install_plan(obj, plan, source="model", rationale=plan.rationale or why)
+            self._log(f"  {why}: model-assisted planning")
+            self.run(obj.id, planning_only=True)
         return obj.id
 
     def _install_plan(
@@ -282,9 +285,43 @@ class CareerManager:
         rationale: str,
         skipped: frozenset[str] = frozenset(),
     ) -> Plan:
+        """Install a plan atomically (finding N5): see ``_install_plan_in``."""
+        with self.db.transaction() as c:
+            plan = self._install_plan_in(
+                c, obj, spec, source=source, rationale=rationale, skipped=skipped
+            )
+        self._log_plan(plan, spec, source)
+        return plan
+
+    def _log_plan(self, plan: Plan, spec: PlanSpec, source: str) -> None:
+        par = [w for w in plan.graph.get("waves", []) if len(w) > 1]
+        self._log(
+            f"  plan v{plan.version} ({source}): {len(spec.steps)} steps in "
+            f"{len(plan.graph.get('waves', []))} waves; parallelizable groups: {par or 'none'}"
+        )
+
+    def _install_plan_in(
+        self,
+        c: sqlite3.Connection,
+        obj: Objective,
+        spec: PlanSpec,
+        *,
+        source: str,
+        rationale: str,
+        skipped: frozenset[str] = frozenset(),
+        generation: int | None = None,
+    ) -> Plan:
+        """Inside the caller's transaction: the new plan version (superseding the current
+        one), its tasks, their modes and every dependency row, and the ``plan`` decision -
+        all or nothing, so a partially installed plan can never exist (finding N5).
+
+        Tasks of the objective whose step the new plan keeps are carried over to the new
+        version (completed work is preserved); unfinished tasks whose step it drops are
+        cancelled, so no task of an outdated version stays runnable."""
         assert obj.id is not None
         wave_list = waves(spec)
-        plan = self.repo.create_plan(
+        plan = self.repo.create_plan_in(
+            c,
             Plan(
                 objective_id=obj.id,
                 version=1,
@@ -295,59 +332,178 @@ class CareerManager:
                     "waves": wave_list,
                     "skipped": sorted(skipped),
                 },
-            )
+            ),
         )
         assert plan.id is not None
-        self._decide_record(
+        self.repo.record_decision_in(
+            c,
             "plan",
             objective_id=obj.id,
             rationale=rationale,
             inputs={"source": source, "plan_version": plan.version, "waves": wave_list},
+            generation=generation,
         )
-        existing = {t.step: t for t in self.repo.list_tasks(obj.id)}
-        ids: dict[str, int] = {}
-        for s in spec.steps:
-            if s.id in existing:  # replans keep completed work
-                tid = existing[s.id].id
-                assert tid is not None
-                ids[s.id] = tid
-                continue
-            policy = self.config.routing.policy(s.task_type)
-            important = s.important if s.important is not None else policy.important
-            task = self.repo.add_task(
-                Task(
-                    objective_id=obj.id,
-                    plan_id=plan.id,
-                    worker=s.worker,
-                    step=s.id,
-                    task_type=s.task_type,
-                    title=s.title or s.task_type,
-                    input={"step": s.model_dump(mode="json"), "objective_inputs": obj.inputs},
-                    priority=s.priority or obj.priority,
-                    important=important,
-                    max_attempts=s.max_attempts or self.config.limits.max_attempts,
-                    budget_usd=s.budget_usd
-                    if s.budget_usd is not None
-                    else self.config.budgets.default_task_usd,
-                    idempotency_key=f"objective:{obj.id}:step:{s.id}",
-                )
-            )
-            assert task.id is not None
-            ids[s.id] = task.id
-            with self.db.transaction() as c:
-                c.execute(
-                    "UPDATE tasks SET mode=?, optional=? WHERE id=?",
-                    (s.mode, int(s.optional), task.id),
-                )
-        for s in spec.steps:
-            for d in s.depends_on:
-                self.repo.add_dependency(ids[s.id], ids[d])
-        par = [w for w in wave_list if len(w) > 1]
-        self._log(
-            f"  plan v{plan.version} ({source}): {len(spec.steps)} steps in "
-            f"{len(wave_list)} waves; parallelizable groups: {par or 'none'}"
+        self._materialize_in(c, obj, plan.id, spec.steps)
+        keep = [s.id for s in spec.steps]
+        now = self._now()
+        c.execute(
+            "UPDATE tasks SET status='cancelled', last_error=?, lease_owner=NULL,"
+            " lease_expires_at=NULL, updated_at=?, finished_at=? WHERE objective_id=?"
+            " AND kind='step' AND step NOT IN (SELECT value FROM json_each(?))"
+            " AND status NOT IN ('succeeded','failed','cancelled','skipped')",
+            ("not in the current plan", now, now, obj.id, to_json(keep)),
         )
         return plan
+
+    def _materialize_in(
+        self, c: sqlite3.Connection, obj: Objective, plan_id: int, steps: list[StepSpec]
+    ) -> int:
+        """Inside the caller's transaction: make ``plan_id`` own a task for every step and
+        every dependency row its graph lists. Existing tasks (same step) are carried over;
+        missing ones are created. Idempotent. Returns how many rows it had to create."""
+        assert obj.id is not None
+        created = 0
+        ids: dict[str, int] = {}
+        for s_ in steps:
+            row = c.execute(
+                "SELECT id FROM tasks WHERE objective_id=? AND step=? AND kind='step'",
+                (obj.id, s_.id),
+            ).fetchone()
+            if row is not None:
+                ids[s_.id] = int(row["id"])
+                c.execute("UPDATE tasks SET plan_id=? WHERE id=?", (plan_id, row["id"]))
+                continue
+            policy = self.config.routing.policy(s_.task_type)
+            important = s_.important if s_.important is not None else policy.important
+            tid = self.repo.add_task_in(
+                c,
+                Task(
+                    objective_id=obj.id,
+                    plan_id=plan_id,
+                    worker=s_.worker,
+                    step=s_.id,
+                    task_type=s_.task_type,
+                    title=s_.title or s_.task_type,
+                    input={"step": s_.model_dump(mode="json"), "objective_inputs": obj.inputs},
+                    priority=s_.priority or obj.priority,
+                    important=important,
+                    max_attempts=s_.max_attempts or self.config.limits.max_attempts,
+                    budget_usd=s_.budget_usd
+                    if s_.budget_usd is not None
+                    else self.config.budgets.default_task_usd,
+                    idempotency_key=f"objective:{obj.id}:step:{s_.id}",
+                ),
+            )
+            c.execute(
+                "UPDATE tasks SET mode=?, optional=? WHERE id=?",
+                (s_.mode, int(s_.optional), tid),
+            )
+            ids[s_.id] = tid
+            created += 1
+        for s_ in steps:
+            for d in s_.depends_on:
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id,"
+                    " kind) VALUES (?,?,'hard')",
+                    (ids[s_.id], ids[d]),
+                )
+                created += cur.rowcount
+        return created
+
+    # ---------------------------------------------------------------- planning phase
+    PLANNING_STEP: ClassVar[str] = "__plan__"
+
+    def _start_planning_in(self, c: sqlite3.Connection, obj: Objective, why: str) -> int:
+        """Inside the caller's transaction: a planning-phase plan version (current while
+        planning runs) and its single planning task. Installing the real plan supersedes
+        the planning-phase version, after which the planning task can never be claimed
+        again. Returns the planning task id."""
+        assert obj.id is not None
+        plan = self.repo.create_plan_in(
+            c,
+            Plan(
+                objective_id=obj.id,
+                version=1,
+                source="planning",
+                rationale=why,
+                graph={
+                    "phase": "planning",
+                    "steps": [],
+                    "waves": [[self.PLANNING_STEP]],
+                    "skipped": [],
+                },
+            ),
+        )
+        assert plan.id is not None
+        budget = obj.budget_usd if obj.budget_usd is not None else None
+        return self.repo.add_task_in(
+            c,
+            Task(
+                objective_id=obj.id,
+                plan_id=plan.id,
+                worker="planner",
+                step=self.PLANNING_STEP,
+                task_type="manager.plan_novel",
+                title="Plan the objective",
+                input={"why": why},
+                priority=obj.priority,
+                max_attempts=self.config.limits.max_attempts,
+                budget_usd=budget,
+                idempotency_key=f"objective:{obj.id}:planning:v{plan.version}",
+                kind="planning",
+            ),
+        )
+
+    def _ensure_plan(self, objective_id: int) -> None:
+        """Before dispatching: an open objective without any plan (e.g. left by a crash
+        inside the old, unowned planning, or after a legacy clarification) gets a planning
+        phase; a current plan whose installation was left incomplete by older code is
+        completed - missing tasks and dependency rows - in one transaction (finding N5)."""
+        obj = self.repo.get_objective(objective_id)
+        if obj.status not in (ObjectiveStatus.ACTIVE, ObjectiveStatus.AWAITING_HUMAN):
+            return
+        plan = self.repo.current_plan(objective_id)
+        if plan is None:
+            if obj.status is not ObjectiveStatus.ACTIVE:
+                return  # waiting for the user; planning starts once they answer
+            try:
+                with self.db.transaction() as c:
+                    if (
+                        c.execute(
+                            "SELECT 1 FROM plans WHERE objective_id=? AND superseded_at IS NULL",
+                            (objective_id,),
+                        ).fetchone()
+                        is None
+                    ):
+                        self._start_planning_in(c, obj, "objective has no plan")
+                        self._log("  no plan found: starting model-assisted planning")
+            except sqlite3.IntegrityError:
+                pass  # another session started it first (one current plan per objective)
+            return
+        if plan.graph.get("phase") == "planning":
+            return
+        steps = [StepSpec.model_validate(s_) for s_ in plan.graph.get("steps", [])]
+        if not steps:
+            return
+        with self.db.transaction() as c:
+            current = c.execute(
+                "SELECT id FROM plans WHERE objective_id=? AND superseded_at IS NULL",
+                (objective_id,),
+            ).fetchone()
+            if current is None or int(current["id"]) != plan.id:
+                return  # replaced meanwhile
+            assert plan.id is not None
+            created = self._materialize_in(c, obj, plan.id, steps)
+            if created:
+                self.repo.record_decision_in(
+                    c,
+                    "plan",
+                    objective_id=objective_id,
+                    rationale="completed an incomplete plan installation",
+                    inputs={"plan_version": plan.version, "rows_created": created},
+                )
+        if created:
+            self._log(f"  plan v{plan.version}: completed {created} missing row(s)")
 
     @staticmethod
     def _degrade_inputs(route: RouteDecision, purpose: str) -> dict[str, Any]:
@@ -397,10 +553,28 @@ class CareerManager:
         )
         self._log(f"  [{purpose}] {label} recorded: {route.reason}")
 
-    def _model_assisted_plan(self, obj: Objective, why: str, session: str) -> PlanSpec | None:
-        """Ask a planning-capable model for a plan; validate, retry and escalate if needed."""
-        assert obj.id is not None
-        self._log(f"  {why}: requesting model-assisted planning")
+    def _clarifications(self, objective_id: int) -> list[str]:
+        """The user's answers to this objective's clarification requests, in order (N3)."""
+        rows = self.db.query(
+            "SELECT answer FROM approval_requests WHERE objective_id=? AND kind='clarification'"
+            " AND status='approved' AND answer IS NOT NULL ORDER BY id",
+            (objective_id,),
+        )
+        return [str(r["answer"]) for r in rows]
+
+    def _execute_planning(self, obj: Objective, task: Task, fence: Fence) -> str:
+        """One attempt of the planning task (audit L9), under its fence like any task.
+
+        Each try within the attempt has a stable logical call key
+        (``task:<id>:a<attempt>:planning:<n>``) and a planned-route checkpoint, so a
+        resumed attempt replays completed planning calls instead of repeating (and paying
+        for) them, and validates the replay against the same model and request. Every
+        write is fenced; the plan is installed atomically in the same transaction that
+        completes the planning task, so a stale planner installs nothing. If no valid plan
+        results, the user is asked for clarification; their answer is used when planning
+        resumes (N3)."""
+        assert obj.id is not None and task.id is not None
+        why = str(task.input.get("why", "model-assisted planning"))
         catalog = [
             {"worker": "extract_keywords", "mode": "deterministic", "task_type": "job.normalize"},
             {"worker": "model_step", "mode": "model", "task_type": "job.analyze"},
@@ -411,39 +585,72 @@ class CareerManager:
         complexity = estimate_complexity(
             self.config.routing.policy(task_type), {"title": obj.title, "ambiguous": True}
         )
+        answers = self._clarifications(obj.id)
         current: tuple[str, Effort] | None = None
         escalation: Escalation | None = None
         feedback = ""
-        for attempt in range(1, self.config.limits.max_attempts + 1):
-            route = self.router.route(
-                task_type,
-                obj.priority.value,
-                complexity,
-                self.budgets.available(obj.id, None, session),
-                current=current,
-                escalation=escalation,
+        reason = "Could not produce a valid plan"
+        for seq in range(self.config.limits.max_attempts):
+            self._guard()
+            step = f"plan_route:{seq}"
+            planned = self._checkpoint(task.id, fence.attempt, step)
+            if planned is not None:
+                choice = Candidate(**planned["choice"])
+            else:
+                route = self.router.route(
+                    task_type,
+                    obj.priority.value,
+                    complexity,
+                    self.budgets.available(obj.id, task.id, fence.session),
+                    current=current,
+                    escalation=escalation,
+                )
+                with self._owned(fence) as c:
+                    self.repo.record_decision_in(
+                        c,
+                        "route",
+                        objective_id=obj.id,
+                        task_id=task.id,
+                        rationale=route.reason,
+                        inputs={"purpose": "planning", **route.to_dict()},
+                        generation=fence.generation,
+                    )
+                    if route.choice is not None:
+                        self._degrade_in(c, fence, obj.id, task.id, route, "planning")
+                        self.repo.save_checkpoint_in(
+                            c,
+                            Checkpoint(
+                                task_id=task.id,
+                                attempt=fence.attempt,
+                                step=step,
+                                state={"choice": asdict(route.choice)},
+                            ),
+                            fence.generation,
+                        )
+                self._log_degrade(route, "planning")
+                if route.choice is None:
+                    reason = f"No model can plan this objective: {route.reason}"
+                    break
+                choice = route.choice
+            answered = (
+                "Clarifications from the user:\n" + "\n".join(f"- {a}" for a in answers) + "\n"
+                if answers
+                else ""
             )
-            self._decide_record(
-                "route",
-                objective_id=obj.id,
-                rationale=route.reason,
-                inputs={"purpose": "planning", **route.to_dict()},
+            salt = (
+                f"plan:{obj.id}:{seq + 1}"
+                if fence.attempt == 1
+                else f"plan:{obj.id}:a{fence.attempt}:{seq + 1}"
             )
-            if route.choice is None:
-                break
-            with self.db.transaction() as c:
-                self._degrade_in(c, None, obj.id, None, route, "planning")
-            self._log_degrade(route, "planning")
-            choice = route.choice
             request = ModelRequest(
                 task_type=task_type,
                 prompt=(
                     f"Objective: {obj.title}\nInputs: {to_json(obj.inputs)}\n"
-                    f"Available workers: {to_json(catalog)}\n{feedback}"
+                    f"Available workers: {to_json(catalog)}\n{answered}{feedback}"
                 ),
                 output_schema=OutputSchema(("steps",), {"steps": "list"}, kind="plan"),
                 effort=choice.effort,
-                seed_salt=f"plan:{obj.id}:{attempt}",
+                seed_salt=salt,
                 simulation={
                     "complexity": complexity.value,
                     "available_workers": catalog,
@@ -452,51 +659,121 @@ class CareerManager:
                     ).expected_output_tokens,
                 },
             )
+            self._guard()
             try:
                 outcome = self.gateway.call(
                     choice.model_id,
                     request,
                     CallContext(
                         obj.id,
-                        None,
-                        attempt,
+                        task.id,
+                        fence.attempt,
                         "planning",
-                        session,
-                        f"objective:{obj.id}:a{attempt}:planning:0",
+                        fence.session,
+                        call_key(task.id, fence.attempt, "planning", seq),
+                        fence,
                     ),
                 )
             except BudgetExceededError as exc:
-                self._log(f"  planning blocked by budget: {exc}")
-                break
+                if exc.is_contention:
+                    self._requeue(fence, task, f"planning budget contention ({exc.scope})")
+                    return "contention"
+                self._block(
+                    fence,
+                    obj,
+                    task,
+                    "budget_increase",
+                    {"reason": f"planning: {exc}", "needed_usd": exc.needed_usd},
+                )
+                return "done"
+            if outcome.status == "late":
+                raise OwnershipLostError(f"task {task.id} planning: {outcome.error}")
             self._log(
-                f"  planning attempt {attempt}: {choice.model_id}/{choice.effort} -> "
+                f"  planning try {seq + 1}: {choice.model_id}/{choice.effort} -> "
                 f"{outcome.status} (${outcome.cost_usd:.5f})"
             )
             try:
                 if not outcome.ok or outcome.payload is None:
                     raise PlanValidationError(outcome.error or outcome.status)
                 out = outcome.payload.get("output", {})
-                plan = parse_plan(
-                    {"steps": out.get("steps", []), "rationale": out.get("rationale")}, self.workers
+                plan_spec = parse_plan(
+                    {"steps": out.get("steps", []), "rationale": out.get("rationale")},
+                    self.workers,
                 )
-                self.gateway.mark_accepted(outcome)
-                return plan
             except PlanValidationError as exc:
                 feedback = f"Previous plan was invalid: {exc}"
                 current, escalation = (choice.model_id, choice.effort), "tier"
-                self._decide_record(
-                    "escalate_tier", objective_id=obj.id, rationale=f"invalid plan: {exc}"[:500]
+                with self._owned(fence) as c:
+                    self.repo.record_decision_in(
+                        c,
+                        "escalate_tier",
+                        objective_id=obj.id,
+                        task_id=task.id,
+                        rationale=f"invalid plan: {exc}"[:500],
+                        inputs={"try": seq, "attempt": fence.attempt},
+                        generation=fence.generation,
+                    )
+                continue
+            self._guard()
+            with self._owned(fence) as c:  # ownership proven, then install atomically
+                plan = self._install_plan_in(
+                    c,
+                    obj,
+                    plan_spec,
+                    source="model",
+                    rationale=plan_spec.rationale or why,
+                    generation=fence.generation,
                 )
-        self._request_user(
-            obj.id,
-            None,
-            "clarification",
-            {
-                "message": "Could not produce a valid plan; please clarify the "
-                "objective or choose a playbook."
-            },
-        )
-        return None
+                c.execute(
+                    "UPDATE tasks SET status='succeeded', attempt_open=0, lease_owner=NULL,"
+                    " lease_expires_at=NULL, updated_at=?, finished_at=? WHERE id=?",
+                    (self._now(), self._now(), task.id),
+                )
+                self.repo.record_decision_in(
+                    c,
+                    "accept",
+                    objective_id=obj.id,
+                    task_id=task.id,
+                    rationale=f"plan v{plan.version} installed",
+                    inputs={"attempt": fence.attempt, "plan_version": plan.version},
+                    generation=fence.generation,
+                )
+                self.gateway.mark_accepted_in(c, outcome)
+            self._log_plan(plan, plan_spec, "model")
+            return "done"
+        # No valid plan in this attempt: ask the user, atomically with closing the attempt.
+        with self._owned(fence) as c:
+            c.execute(
+                "UPDATE tasks SET status='awaiting_human', attempt_open=0, lease_owner=NULL,"
+                " lease_expires_at=NULL, last_error=?, updated_at=? WHERE id=?",
+                (reason[:300], self._now(), task.id),
+            )
+            self.repo.record_decision_in(
+                c,
+                "await_human",
+                objective_id=obj.id,
+                task_id=task.id,
+                rationale=reason,
+                inputs={"attempt": fence.attempt, "kind": "clarification"},
+                generation=fence.generation,
+            )
+            rid = self.repo.request_user_in(
+                c,
+                obj.id,
+                task.id,
+                "clarification",
+                {
+                    "message": f"{reason}; please clarify the objective (answer with "
+                    "`approve <id> --answer ...`) or choose a playbook."
+                },
+            )
+            c.execute(
+                "UPDATE objectives SET status='awaiting_human', stop_reason=?, updated_at=?"
+                " WHERE id=? AND status IN ('active','awaiting_human')",
+                ("planning needs clarification", self._now(), obj.id),
+            )
+        self._log(f"  [planning] WAITING FOR YOU (clarification, request {rid}): {reason}")
+        return "done"
 
     # ================================================================ run / resume
     def run(
@@ -505,6 +782,7 @@ class CareerManager:
         *,
         max_attempts: int | None = None,
         force_recover: bool = False,
+        planning_only: bool = False,
     ) -> RunSummary:
         """Advance an objective until done, blocked on the user, or ``max_attempts`` task
         attempts have started in this invocation. Safe to call repeatedly (resume).
@@ -517,6 +795,7 @@ class CareerManager:
         Independent ready tasks run concurrently, at most ``execution.max_concurrency`` at a
         time. ``force_recover`` treats every other session as dead (use only when you know
         no other CareerOS process is running, e.g. after a container restart).
+        ``planning_only`` runs only the objective's planning task (used by ``submit``).
         """
         start = len(self.events)
         session = self.repo.start_session()
@@ -524,6 +803,7 @@ class CareerManager:
         self._halt.clear()
         self._lease_lost.clear()
         self._recover(objective_id, session, force=force_recover)
+        self._ensure_plan(objective_id)
         limit = self.config.execution.max_concurrency
         hb_stop = threading.Event()
         lease = LeaseState(last_success=self.clock())
@@ -596,6 +876,8 @@ class CareerManager:
                     for task in self._ready_tasks(objective_id):
                         if len(running) >= limit:
                             break
+                        if planning_only and task.kind != "planning":
+                            continue
                         assert task.id is not None
                         if task.id in deferred:
                             # Requeued for budget contention: wait until another task
@@ -620,6 +902,13 @@ class CareerManager:
                         break
                     if cancelling:
                         stop_reason = f"cancelled: {self._cancel_text()}"
+                        break
+                    if planning_only and not deferred:
+                        plan = self.repo.current_plan(objective_id)
+                        if plan is not None and plan.graph.get("phase") != "planning":
+                            stop_reason = "plan installed"
+                        else:
+                            stop_reason = self._settle_planning(objective_id)
                         break
                     if not active:
                         stop_reason = obj.stop_reason
@@ -1119,8 +1408,41 @@ class CareerManager:
                 continue
             if all(d.status is TaskStatus.SUCCEEDED for d in deps):
                 ready.append(t)
+        # The claim's own readiness rule decides (plan membership, complete dependency
+        # rows, prerequisites, active objective), so dispatcher and claim cannot disagree.
+        claimable = {
+            int(r["id"])
+            for r in self.db.query(
+                "SELECT id FROM tasks WHERE objective_id=? AND " + CLAIMABLE_SQL,  # noqa: S608
+                (objective_id,),
+            )
+        }
+        ready = [t for t in ready if t.id in claimable]
         ready.sort(key=lambda t: (order.get(t.step or "", 99), t.id or 0))
         return ready
+
+    def _settle_planning(self, objective_id: int) -> str:
+        """Why a planning-only run stopped without installing a plan."""
+        rows = self.db.query(
+            "SELECT status FROM tasks WHERE objective_id=? AND kind='planning'"
+            " ORDER BY id DESC LIMIT 1",
+            (objective_id,),
+        )
+        status = rows[0]["status"] if rows else None
+        if status in ("awaiting_human", "blocked_budget"):
+            self.repo.set_objective_status(
+                objective_id,
+                ObjectiveStatus.AWAITING_HUMAN,
+                "waiting for the user's decision",
+                only_from=(ObjectiveStatus.ACTIVE,),
+            )
+            return "waiting for the user's decision"
+        if status in ("running", "reviewing"):
+            return "planning is running in another session"
+        obj = self.repo.get_objective(objective_id)
+        if obj.status is not ObjectiveStatus.ACTIVE:
+            return obj.stop_reason or obj.status.value
+        return "planning not finished"
 
     def _settle_idle(self, obj: Objective, session: str) -> str:
         assert obj.id is not None
@@ -1155,7 +1477,17 @@ class CareerManager:
                 raise CareerOSError(f"Unknown definition-of-done check {check!r}")
             if arg == "all_required":
                 plan = self.repo.current_plan(obj.id)
-                pruned = set((plan.graph if plan else {}).get("skipped", []))
+                if plan is None or plan.graph.get("phase") == "planning":
+                    return False  # nothing to be done yet: planning has not finished
+                pruned = set(plan.graph.get("skipped", []))
+                have = {t.step for t in tasks if t.status is TaskStatus.SUCCEEDED}
+                for step_ in plan.graph.get("steps", []):
+                    if (
+                        step_["id"] not in pruned
+                        and not step_.get("optional", False)
+                        and step_["id"] not in have
+                    ):
+                        return False  # every required step of the plan, not just the rows
                 required = [t for t in tasks if not self._optional(t) and t.step not in pruned]
                 if not required or any(t.status is not TaskStatus.SUCCEEDED for t in required):
                     return False
@@ -1229,6 +1561,8 @@ class CareerManager:
         with self._owned(fence):
             pass  # verify the token before doing any work
         assert task.id is not None and obj.id is not None
+        if task.kind == "planning":
+            return self._execute_planning(obj, task, fence)
         spec = self._step(task)
         step = StepContext(
             step_id=spec.id,
@@ -2264,6 +2598,7 @@ class CareerManager:
         extra_usd: float = 0.0,
         extra_attempts: int = 1,
         accept_downgrade: bool = False,
+        answer: str | None = None,
     ) -> None:
         """Record the user's decision and make the blocked task runnable again.
 
@@ -2272,6 +2607,9 @@ class CareerManager:
         request offered. The downgrade applies only to the routing step that asked for it
         (the task itself, or its review). Validation and every write are one transaction,
         each write conditional on the state it expects (audit L3, finding N1).
+
+        A planning ``clarification`` needs the user's ``answer``: it is stored with the
+        request and planning resumes with it in a new attempt (finding N3).
         """
 
         def downgrade(c: sqlite3.Connection, r: Any) -> None:
@@ -2324,6 +2662,18 @@ class CareerManager:
             kind, obj_id, task_id = r["kind"], r["objective_id"], r["task_id"]
             if kind == "budget_increase" and extra_usd <= 0:
                 raise CareerOSError("A budget approval needs a positive simulated amount.")
+            if kind == "clarification":
+                if not (answer and answer.strip()):
+                    raise CareerOSError("A clarification needs an answer (--answer).")
+                c.execute(
+                    "UPDATE approval_requests SET answer=? WHERE id=?",
+                    (answer.strip(), request_id),
+                )
+                if task_id is not None:  # planning resumes in a new attempt with the answer
+                    c.execute(
+                        "UPDATE tasks SET max_attempts = max_attempts + 1 WHERE id=?",
+                        (task_id,),
+                    )
             now = utc_now_iso()
             self._resolve_in(
                 c,

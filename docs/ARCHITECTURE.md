@@ -1451,3 +1451,82 @@ other connections see the old or the new database, never a mixture), and verifie
 result. A restored mid-run snapshot behaves exactly like a crash at that moment: recovery
 resumes open attempts, abandons in-flight calls (charged their reservation) and reconciles
 any late reply once.
+
+### 19.5 C5 — planning safety (L9, N3, N5)
+
+**Before.** Model-assisted planning ran inside `submit` as an unowned side operation: a
+session with no heartbeat, no fencing token, no checkpoints and no way to resume. Planning
+longer than a lease was taken for dead and its call abandoned (and charged); a crash during
+planning left an objective that `resume` marked **failed**; answering a planning
+clarification led nowhere; and `_install_plan` wrote the plan, each task and the
+dependency rows in separate transactions, so a crash in between left tasks without their
+dependency rows - claimable too early - or a partial task set.
+
+**Planning is a task.** A novel objective is created, in the same transaction, with a
+*planning-phase* plan version (`source='planning'`, `graph.phase='planning'`) and one
+planning task (`tasks.kind='planning'`, step `__plan__`) belonging to it. That task is
+executed by the ordinary dispatcher and therefore inherits every guarantee of task
+execution, with no second mechanism: exclusive claim with generation and lease, heartbeat
+renewal, fenced writes, conditional recovery takeover, graceful shutdown hand-back,
+attempt accounting, late-reply fencing. `submit` runs it immediately
+(`run(objective_id, planning_only=True)`), so callers still see the plan (or the
+clarification request) when `submit` returns; `run` on an objective still in its planning
+phase plans first and then executes the plan in the same session.
+
+**Lifecycle of one planning attempt** (`_execute_planning`, under the task's fence):
+
+1. For each try `n` within the attempt, the route is planned once and checkpointed
+   (`plan_route:<n>`); a resumed attempt reuses it.
+2. The call's logical key is `task:<id>:a<attempt>:planning:<n>`: a completed call is
+   replayed after a crash, never repeated or billed twice; replay validates model, effort
+   and request (L1).
+3. An invalid plan escalates (fenced decision) and the next try gets the feedback.
+4. A valid plan is installed **in the same fenced transaction** that completes the planning
+   task: a stale planner's fence fails, so it installs nothing.
+5. With no valid plan, the attempt is closed, a `clarification` request (tied to the
+   planning task) is raised and the objective waits - all in one fenced transaction.
+
+**Atomic installation and plan versions** (`_install_plan_in`): the new plan version
+(superseding the current one), every task (with mode/optional), every dependency row and
+the `plan` decision are written in one transaction - for playbooks together with the
+objective itself. A partially installed plan therefore cannot exist. Tasks are explicitly
+associated with the plan version that lists them (`tasks.plan_id`): a replan or prune
+creating a new version carries the tasks over in the same transaction, and unfinished
+tasks whose step the new version drops are cancelled. A unique partial index allows one
+current plan per objective. The claim (`CLAIMABLE_SQL`) additionally requires that the
+task belongs to the objective's **current** plan version and that its dependency rows are
+**complete** with respect to that version's graph; the dispatcher selects ready tasks with
+the same SQL, so the two cannot disagree. The planning task's version is superseded when
+the real plan is installed, so it can never run again. The definition of done is checked
+against the plan's steps, not just the task rows present.
+
+**Clarification and replanning** (N3): `approve(request_id, answer=...)` (CLI `approve <id>
+--answer "..."`) requires an answer for a clarification, stores it
+(`approval_requests.answer`), releases the planning task (conditionally, from
+`awaiting_human`) and allows it one more attempt. The next run plans again in a new
+attempt with every answer so far in the prompt. Repeated clarifications and interruptions
+during replanning are ordinary attempts and recoveries.
+
+**Migration `0006_c5_planning.sql` and backfill**
+
+* superseding all but the newest of several current plans, then a unique partial index
+  `idx_plans_one_current`;
+* re-associating tasks with the current version when it lists their step (older code left
+  them on the version that created them);
+* inserting dependency rows the current plan's graph lists but a partial installation
+  never wrote (`INSERT OR IGNORE`, from the graph via `json_each`);
+* `tasks.kind` (`step` | `planning`, default `step`) and `approval_requests.answer`.
+
+What SQL cannot rebuild is completed at run time, before dispatching (`_ensure_plan`): a
+task missing altogether from the current plan is created (with its dependency rows) in one
+transaction, recorded as a `plan` decision ("completed an incomplete plan installation");
+until then the claim refuses any task whose dependency rows are incomplete, and the
+definition of done is not met. An open objective with no plan at all (left by the old
+planning) gets a planning phase; a legacy clarification (no task) answered by the user
+leads to planning with that answer.
+
+Test changes required by the new design: `test_unfamiliar_objective_gets_model_assisted_plan`
+asserted that the planning call belonged to **no** task - the unowned design L9 removes; it
+now asserts the call belongs to the planning task. Three tests asserted schema version 5;
+they now assert the latest bundled version. The `novel` demo shows the planning task and a
+model plan at version 2 (version 1 is the planning phase).

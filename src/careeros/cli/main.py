@@ -187,13 +187,19 @@ def approve(
             help="Instead of more budget, accept the lower-quality option the request offers.",
         ),
     ] = False,
+    answer: Annotated[
+        str | None,
+        typer.Option("--answer", help="Your answer to a planning clarification request."),
+    ] = None,
     config_dir: ConfigDirOpt = None,
 ) -> None:
     """Approve a pending request (budget amounts are simulated; nothing is charged)."""
     cfg = _load(config_dir)
     try:
         with open_context(cfg) as ctx:
-            CareerManager(ctx).approve(request_id, extra_usd=usd, accept_downgrade=accept_downgrade)
+            CareerManager(ctx).approve(
+                request_id, extra_usd=usd, accept_downgrade=accept_downgrade, answer=answer
+            )
             typer.echo(f"Request {request_id} approved. Run `careeros resume <objective>`.")
     except CareerOSError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
