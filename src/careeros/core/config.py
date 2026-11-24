@@ -14,6 +14,7 @@ explicitly approved milestone (M10).
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -137,6 +138,48 @@ class LimitsConfig(_Strict):
                 f"{self.heartbeat_interval()}, margin={self.safety_margin()}"
             )
         return self
+
+
+class ApprovalsConfig(_Strict):
+    """Bounds on what a user approval can authorise (audit L12).
+
+    Every limit is explicit and configurable. Unset limits default to values the user
+    already configures elsewhere - never a new magic number - and are resolved by
+    ``AppConfig.approval_limits()``:
+
+    * ``max_budget_increase_usd`` (one request) defaults to ``budgets.default_objective_usd``;
+    * ``max_total_budget_increase_usd`` (all grants for one objective) defaults to
+      ``budgets.simulated_monthly_usd``;
+    * ``max_extra_attempts`` (one request) and ``max_total_extra_attempts`` (all grants
+      for one task) default to ``limits.max_attempts`` - at most doubling a task's attempts;
+    * ``max_clarifications`` (answered planning clarifications per objective) defaults to
+      ``limits.max_attempts``.
+
+    Approvals only raise an objective's and a task's own budget lines; the session and
+    monthly lines (the global limits) are never changed by an approval and still apply to
+    every reservation. A request is open for ``request_ttl_hours`` (explicit default:
+    72 h); a downgrade grant is usable for ``downgrade_ttl_hours`` (default: the request
+    lifetime) and only for the attempt it was approved for.
+    """
+
+    request_ttl_hours: float = Field(default=72.0, gt=0)
+    downgrade_ttl_hours: float | None = Field(default=None, gt=0)
+    max_budget_increase_usd: float | None = Field(default=None, ge=0)
+    max_total_budget_increase_usd: float | None = Field(default=None, ge=0)
+    max_extra_attempts: int | None = Field(default=None, ge=0)
+    max_total_extra_attempts: int | None = Field(default=None, ge=0)
+    max_clarifications: int | None = Field(default=None, ge=0)
+
+
+@dataclass(frozen=True)
+class ApprovalLimits:
+    request_ttl_hours: float
+    downgrade_ttl_hours: float
+    max_budget_increase_usd: float
+    max_total_budget_increase_usd: float
+    max_extra_attempts: int
+    max_total_extra_attempts: int
+    max_clarifications: int
 
 
 class EligibilityRule(_Strict):
@@ -338,7 +381,37 @@ class AppConfig(_Strict):
     eligibility: EligibilityConfig = EligibilityConfig()
     models: tuple[ModelProfile, ...] = ()
     routing: RoutingConfig = RoutingConfig()
+    approvals: ApprovalsConfig = ApprovalsConfig()
     config_dir: Path | None = None
+
+    def approval_limits(self) -> ApprovalLimits:
+        """The approval bounds in effect (unset values resolved; see ``ApprovalsConfig``)."""
+        a, b, lim = self.approvals, self.budgets, self.limits
+        return ApprovalLimits(
+            request_ttl_hours=a.request_ttl_hours,
+            downgrade_ttl_hours=a.downgrade_ttl_hours or a.request_ttl_hours,
+            max_budget_increase_usd=(
+                a.max_budget_increase_usd
+                if a.max_budget_increase_usd is not None
+                else b.default_objective_usd
+            ),
+            max_total_budget_increase_usd=(
+                a.max_total_budget_increase_usd
+                if a.max_total_budget_increase_usd is not None
+                else b.simulated_monthly_usd
+            ),
+            max_extra_attempts=(
+                a.max_extra_attempts if a.max_extra_attempts is not None else lim.max_attempts
+            ),
+            max_total_extra_attempts=(
+                a.max_total_extra_attempts
+                if a.max_total_extra_attempts is not None
+                else lim.max_attempts
+            ),
+            max_clarifications=(
+                a.max_clarifications if a.max_clarifications is not None else lim.max_attempts
+            ),
+        )
 
     @model_validator(mode="after")
     def _unique_model_ids(self) -> AppConfig:

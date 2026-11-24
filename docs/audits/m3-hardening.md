@@ -16,7 +16,7 @@ fails on the baseline passes after the change, and CI is green on the fixing com
 | L9 | Planning has no heartbeat, ownership or resume (reproduced) | C5 | **Fixed** in C5 (evidence below) |
 | N3 | Approving a planning clarification does not re-plan | C5 | **Fixed** in C5 |
 | N5 | Partial plan installation (found during C1) | C5 | **Fixed** in C5 (all five requirements below) |
-| L12 | Approvals have no expiry or caps | C6 | Open |
+| L12 | Approvals have no expiry or caps | C6 | **Fixed** in C6 (evidence below) |
 | L11 | No factual-accuracy policy | C7 | Open |
 | N4 | Cached accepted results skip review (factual policy version) | C7 | Open |
 | L6 | Worker-failure/T2 failure paths | C8 | Verified consistent by inspection; failure-injection tests pending |
@@ -156,6 +156,29 @@ partial installs; migration 0006 backfills.
 
 Verification: full suite 621 passed; `ruff check`, `ruff format --check`, `mypy` clean;
 coverage 96% (fencing 100%, repositories 96%, manager 94%).
+
+## C6 evidence
+
+`tests/test_hardening_c6_baseline.py` (public behaviour only) - all four fail on the
+baseline (`6bf195f`) and pass after C6: a request approved 120 days later was applied; a
++$1000 (simulated) approval was accepted; 100 extra attempts were accepted; a clarification
+answer was recorded as a permission grant.
+
+`tests/test_hardening_c6.py` (injected clocks, no wall-time waits): explicit expiry on
+every request; approval one second before, at and long after expiry (expired: nothing
+applied, a fresh request raised); an expired request cannot be denied; expired requests
+replaced when a run starts; repeated delivery applied once; a second grant for one request
+refused by the database; six concurrent approver processes, and approvers racing deniers,
+consume a request exactly once; per-request and cumulative budget limits (session and
+monthly lines unchanged); per-request and cumulative attempt limits; downgrade grant scoped
+to task, purpose and attempt and expiring, and an expired downgrade not used; stale approval
+after objective completion and after replanning (outdated plan version; dropped step); a
+process killed inside grant consumption applies nothing and the approval then succeeds
+once; clarification answers are not grants and are limited; migration backfill and duplicate
+archiving; limit defaults come from existing settings.
+
+Verification: full suite 645 passed; `ruff check`, `ruff format --check`, `mypy` clean;
+coverage 96% (manager 94%, config 96%).
 
 ## N5 — requirements carried into C5
 

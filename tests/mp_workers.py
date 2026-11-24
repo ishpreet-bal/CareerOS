@@ -608,3 +608,25 @@ def plan_concurrently(data_dir: str, objective_id: int, barrier: Any, out: Any) 
             _report(out, stop_reason=s.stop_reason, dispatches=s.dispatches)
     except BaseException:
         _report(out, error=traceback.format_exc())
+
+
+def approve_and_die(data_dir: str, request_id: int, extra_usd: float, out: Any) -> None:
+    """Approve a budget request and kill the process (``os._exit``) half-way through the
+    deciding transaction - after the objective's budget line was raised, before COMMIT."""
+    try:
+        from careeros.cost.budget import BudgetManager
+
+        orig = BudgetManager.raise_limit_in
+
+        def raise_limit_in(c: Any, scope: str, ref: str, amount: float) -> None:
+            orig(c, scope, ref, amount)
+            _report(out, died_at="grant consumption")
+            time.sleep(0.2)
+            os._exit(17)
+
+        BudgetManager.raise_limit_in = staticmethod(raise_limit_in)  # type: ignore[method-assign,assignment]
+        with _ctx(data_dir) as c:
+            _manager(c, None).approve(request_id, extra_usd=extra_usd)
+            _report(out, status="finished-without-dying")
+    except BaseException:
+        _report(out, error=traceback.format_exc())

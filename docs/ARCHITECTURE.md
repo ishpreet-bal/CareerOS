@@ -1530,3 +1530,59 @@ asserted that the planning call belonged to **no** task - the unowned design L9 
 now asserts the call belongs to the planning task. Three tests asserted schema version 5;
 they now assert the latest bundled version. The `novel` demo shows the planning task and a
 model plan at version 2 (version 1 is the planning phase).
+
+### 19.6 C6 — bounded, expiring, scoped, single-use approvals (L12)
+
+**Before.** A request stayed decidable forever; one approval could add any (simulated)
+amount or any number of attempts; a downgrade approval set a floor on the task that every
+later attempt inherited; grant rows were free-text scopes with no link to their request
+beyond a JSON field; a clarification answer was recorded as an `other` permission grant.
+
+**Lifecycle of a request.** Every request is created with an explicit `expires_at`
+(`approvals.request_ttl_hours`, explicit default 72 h, from the manager's injectable
+clock). Requests created before C6 expire one lifetime after `created_at`. A request is
+decided only inside the deciding transaction (C1) and only if it is pending, unexpired, its
+objective is open, its task is still in the blocked state the request was made for, **and**
+the task still belongs to the objective's current plan version. Expiry is enforced there,
+for approve and deny alike, not only when listing. An expired request is withdrawn; if its
+objective is open and its task still waits for that decision, a fresh request with the same
+details (`replaces_request`) and a new expiry is raised in the same transaction - the
+caller is told its id - so a stale decision is never applied and waiting work is not
+stranded. Each run also withdraws and replaces expired requests before dispatching.
+`approvals` (CLI) shows each request's expiry.
+
+**Grants.** A grant row (`approvals`) now records the `objective_id`, `task_id`,
+`request_id` and `attempt` that produced it, its `purpose` (task or review routing), the
+amounts it authorised (`extra_usd`, `extra_attempts`) and, for downgrades, `expires_at`.
+At most one grant per request exists (`idx_approvals_one_per_request`): together with the
+conditional request transition this makes a request impossible to consume twice, even if
+its state were reset. Applying a grant is part of the same transaction as validating and
+resolving the request; a crash anywhere in it applies nothing.
+
+| Grant | Bound | Enforced | Configured by (default) |
+|---|---|---|---|
+| Budget increase, one request | `extra_usd` ≤ limit | at consumption | `max_budget_increase_usd` (= `budgets.default_objective_usd`) |
+| Budget increases, one objective | Σ granted `extra_usd` ≤ limit | at consumption, from grant rows | `max_total_budget_increase_usd` (= `budgets.simulated_monthly_usd`) |
+| Extra attempts, one request | 1 ≤ `extra_attempts` ≤ limit | at consumption | `max_extra_attempts` (= `limits.max_attempts`) |
+| Extra attempts, one task | Σ granted ≤ limit | at consumption, from grant rows | `max_total_extra_attempts` (= `limits.max_attempts`) |
+| Clarification answers, one objective | count ≤ limit | at consumption | `max_clarifications` (= `limits.max_attempts`) |
+| Quality downgrade | this task, this purpose, this attempt, until expiry | at routing time | `downgrade_ttl_hours` (= request lifetime) |
+
+Requests over a limit are refused with the limit named - never silently clamped - and stay
+pending. Approvals raise only the objective's and the task's own budget lines; the session
+and monthly lines are never changed by an approval and still bound every reservation.
+
+**Downgrades** are honoured by routing (`_approved_floor`) only while a grant exists for
+exactly that task, routing purpose and attempt and has not expired or been revoked; the
+attempt blocked for the decision stays open, so the approved attempt is the one that uses
+it. A later attempt, the other purpose, another task or an expired grant gets no
+downgrade - routing asks again.
+
+**Clarification answers** are stored on the request (`approval_requests.answer`) and
+create no grant row, so they can never be mistaken for, or counted as, a permission.
+
+**Migration `0007_c6_bounded_approvals.sql`**: `approval_requests.expires_at`; `approvals`
+rebuilt with the scope and amount columns and kind `extra_attempts`, backfilled from each
+grant's request (retry-limit grants become `extra_attempts`, budget grants get
+`extra_usd`); grants recorded twice for one request (possible before C1) archived in
+`approvals_duplicates` (the first is kept); the unique index above.

@@ -766,6 +766,7 @@ class CareerManager:
                     "message": f"{reason}; please clarify the objective (answer with "
                     "`approve <id> --answer ...`) or choose a playbook."
                 },
+                **self._request_times(),
             )
             c.execute(
                 "UPDATE objectives SET status='awaiting_human', stop_reason=?, updated_at=?"
@@ -803,6 +804,7 @@ class CareerManager:
         self._halt.clear()
         self._lease_lost.clear()
         self._recover(objective_id, session, force=force_recover)
+        self._expire_requests(objective_id)
         self._ensure_plan(objective_id)
         limit = self.config.execution.max_concurrency
         hb_stop = threading.Event()
@@ -1664,8 +1666,7 @@ class CareerManager:
         )
         # Committed spend only: concurrent reservations are enforced at reservation time.
         budget = self.budgets.available(obj.id, task.id, self._session, include_reservations=False)
-        row = self.db.query_one("SELECT approved_floor FROM tasks WHERE id=?", (task.id,))
-        approved = row["approved_floor"] if row is not None else None
+        approved = self._approved_floor(task.id, task.attempt, "task")
         current = (
             (task.current_model_id, cast(Effort, task.current_effort or "none"))
             if task.current_model_id
@@ -2057,9 +2058,7 @@ class CareerManager:
             choice = Candidate(**planned["choice"])
         else:
             complexity = estimate_complexity(self.config.routing.policy(task_type), {})
-            row = self.db.query_one(
-                "SELECT approved_review_floor FROM tasks WHERE id=?", (task.id,)
-            )
+            review_floor = self._approved_floor(task.id, attempt, "review")
             route = self.router.route(
                 task_type,
                 task.priority.value,
@@ -2067,7 +2066,7 @@ class CareerManager:
                 self.budgets.available(obj.id, task.id, fence.session, include_reservations=False),
                 exclude_models=frozenset({author_model}),
                 # Only an approval given for *this review* lowers its floor (audit M6).
-                approved_floor=row["approved_review_floor"] if row is not None else None,
+                approved_floor=review_floor,
             )
             if route.choice is None:
                 self._block(
@@ -2324,6 +2323,7 @@ class CareerManager:
                     task.id,
                     "retry_limit",
                     {"reason": d.reason, "last_outcome": problem},
+                    **self._request_times(),
                 )
             else:
                 c.execute(
@@ -2397,7 +2397,9 @@ class CareerManager:
                 inputs={**details, "attempt": fence.attempt, "attempt_open": True},
                 generation=fence.generation,
             )
-            rid = self.repo.request_user_in(c, obj.id, task.id, kind, details)
+            rid = self.repo.request_user_in(
+                c, obj.id, task.id, kind, details, **self._request_times()
+            )
         self._log(
             f"  [{task.step}] WAITING FOR YOU ({kind}, request {rid}): {details.get('reason', '')}"
         )
@@ -2410,7 +2412,9 @@ class CareerManager:
         The objective waits for the user only if it is still open (audit L3); a question
         raised after another decision finished it is recorded as withdrawn."""
         with self.db.transaction() as c:
-            rid = self.repo.request_user_in(c, objective_id, task_id, kind, details)
+            rid = self.repo.request_user_in(
+                c, objective_id, task_id, kind, details, **self._request_times()
+            )
             if task_id is None:
                 cur = c.execute(
                     "UPDATE objectives SET status='awaiting_human', stop_reason=?, updated_at=?"
@@ -2476,21 +2480,107 @@ class CareerManager:
 
     # ================================================================ user decisions
     def pending_requests(self, objective_id: int | None = None) -> list[dict[str, Any]]:
+        """Pending requests with their expiry. An expired request is listed as expired
+        (it can no longer be decided; the next run replaces it if the work still waits)."""
         sql = "SELECT * FROM approval_requests WHERE status='pending'"
         params: tuple[Any, ...] = ()
         if objective_id is not None:
             sql += " AND objective_id=?"
             params = (objective_id,)
-        return [
-            {
-                "id": r["id"],
-                "objective_id": r["objective_id"],
-                "task_id": r["task_id"],
-                "kind": r["kind"],
-                "details": from_json(r["details"], {}),
-            }
-            for r in self.db.query(sql + " ORDER BY id", params)
-        ]
+        now = self._now()
+        out = []
+        for r in self.db.query(sql + " ORDER BY id", params):
+            expires = self._expiry_of(r)
+            out.append(
+                {
+                    "id": r["id"],
+                    "objective_id": r["objective_id"],
+                    "task_id": r["task_id"],
+                    "kind": r["kind"],
+                    "details": from_json(r["details"], {}),
+                    "expires_at": expires,
+                    "expired": expires <= now,
+                }
+            )
+        return out
+
+    def _approved_floor(self, task_id: int, attempt: int, purpose: str) -> float | None:
+        """The quality floor a user approved for this task's routing step, if a grant
+        exists for exactly this task, purpose and attempt and has not expired or been
+        revoked (audit L12). Otherwise no downgrade applies."""
+        r = self.db.query_one(
+            "SELECT details FROM approvals WHERE kind='quality_downgrade' AND task_id=?"
+            " AND purpose=? AND attempt=? AND revoked_at IS NULL"
+            " AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC LIMIT 1",
+            (task_id, purpose, attempt, self._now()),
+        )
+        if r is None:
+            return None
+        return max(0.0, float(from_json(r["details"], {})["floor_to"]) - 1e-9)
+
+    # ---------------------------------------------------------------- expiry (L12)
+    def _hours_from_now(self, hours: float) -> str:
+        return _iso(self.clock() + timedelta(hours=hours))
+
+    def _request_times(self) -> dict[str, str]:
+        """Creation time and explicit expiry for a new request (manager clock)."""
+        return {
+            "created_at": self._now(),
+            "expires_at": self._hours_from_now(self.config.approval_limits().request_ttl_hours),
+        }
+
+    def _expiry_of(self, r: Any) -> str:
+        if r["expires_at"]:
+            return str(r["expires_at"])
+        created = datetime.fromisoformat(str(r["created_at"]))
+        return _iso(created + timedelta(hours=self.config.approval_limits().request_ttl_hours))
+
+    def _expire_in(self, c: sqlite3.Connection, r: Any, now: str) -> int | None:
+        """Inside the caller's transaction: withdraw an expired request (conditionally) and,
+        if its objective is still open and its task still waits for exactly this kind of
+        decision, raise a fresh request with the same details and a new expiry - so a stale
+        request can never be applied, while the waiting work is not stranded. Returns the
+        replacement request id, if any."""
+        cur = c.execute(
+            "UPDATE approval_requests SET status='withdrawn', resolution=?, resolved_at=?"
+            " WHERE id=? AND status='pending'",
+            (f"expired at {self._expiry_of(r)}", now, r["id"]),
+        )
+        if cur.rowcount != 1:
+            return None
+        obj = c.execute("SELECT status FROM objectives WHERE id=?", (r["objective_id"],)).fetchone()
+        if obj is None or obj["status"] not in ("active", "awaiting_human"):
+            return None
+        if r["task_id"] is not None:
+            t = c.execute("SELECT status FROM tasks WHERE id=?", (r["task_id"],)).fetchone()
+            expected = self._BLOCKED_STATE.get(r["kind"])
+            allowed = (expected.value,) if expected is not None else self._WAITING
+            if t is None or t["status"] not in allowed:
+                return None
+        details = {**from_json(r["details"], {}), "replaces_request": r["id"]}
+        return self.repo.request_user_in(
+            c, r["objective_id"], r["task_id"], r["kind"], details, **self._request_times()
+        )
+
+    def _expire_requests(self, objective_id: int) -> None:
+        """Before dispatching: withdraw (and, where the work still waits, replace) every
+        expired pending request of the objective."""
+        now = self._now()
+        for r in self.db.query(
+            "SELECT * FROM approval_requests WHERE objective_id=? AND status='pending'",
+            (objective_id,),
+        ):
+            if self._expiry_of(r) > now:
+                continue
+            with self.db.transaction() as c:
+                current = c.execute(
+                    "SELECT * FROM approval_requests WHERE id=?", (r["id"],)
+                ).fetchone()
+                new = self._expire_in(c, current, now) if current else None
+            self._log(
+                f"  request {r['id']} ({r['kind']}) expired"
+                + (f"; replaced by request {new}" if new else "")
+            )
 
     _BLOCKED_STATE: ClassVar[dict[str, TaskStatus]] = {
         "budget_increase": TaskStatus.BLOCKED_BUDGET,
@@ -2512,14 +2602,24 @@ class CareerManager:
             raise CareerOSError(f"Approval request {request_id} is already {r['status']}")
         obj = c.execute("SELECT status FROM objectives WHERE id=?", (r["objective_id"],)).fetchone()
         problem = None
-        if obj["status"] not in ("active", "awaiting_human"):
+        if self._expiry_of(r) <= self._now():  # enforced when deciding, not only when listed
+            problem = f"it expired at {self._expiry_of(r)}"
+        elif obj["status"] not in ("active", "awaiting_human"):
             problem = f"objective {r['objective_id']} is already {obj['status']}"
         elif r["task_id"] is not None:
-            t = c.execute("SELECT status FROM tasks WHERE id=?", (r["task_id"],)).fetchone()
+            t = c.execute(
+                "SELECT status, plan_id, objective_id FROM tasks WHERE id=?", (r["task_id"],)
+            ).fetchone()
             expected = self._BLOCKED_STATE.get(r["kind"])
             allowed = (expected.value,) if expected is not None else self._WAITING
+            current = c.execute(
+                "SELECT id FROM plans WHERE objective_id=? AND superseded_at IS NULL",
+                (t["objective_id"],),
+            ).fetchone()
             if t["status"] not in allowed:
                 problem = f"task {r['task_id']} is {t['status']}, no longer {'/'.join(allowed)}"
+            elif current is None or int(current["id"]) != int(t["plan_id"]):
+                problem = f"task {r['task_id']} is no longer part of the current plan"
         return r, problem
 
     def _decide_request(
@@ -2527,18 +2627,22 @@ class CareerManager:
     ) -> Any:
         """Validate and decide a request in one write transaction. An obsolete request is
         withdrawn (and that withdrawal committed) instead of being applied."""
+        replacement: int | None = None
         with self.db.transaction() as c:
             r, problem = self._validate_request(request_id, c)
             if problem is None:
                 apply(c, r)
+            elif problem.startswith("it expired"):
+                replacement = self._expire_in(c, r, self._now())
             else:
                 c.execute(
                     "UPDATE approval_requests SET status='withdrawn', resolution=?,"
                     " resolved_at=? WHERE id=? AND status='pending'",
-                    (f"withdrawn: {problem}", utc_now_iso(), request_id),
+                    (f"withdrawn: {problem}", self._now(), request_id),
                 )
         if problem is not None:
-            raise CareerOSError(f"Approval request {request_id} is obsolete: {problem}.")
+            hint = f"; decide the new request {replacement} instead" if replacement else ""
+            raise CareerOSError(f"Approval request {request_id} is obsolete: {problem}{hint}.")
         return r
 
     @staticmethod
@@ -2612,6 +2716,53 @@ class CareerManager:
         request and planning resumes with it in a new attempt (finding N3).
         """
 
+        limits = self.config.approval_limits()
+
+        def scope_attempt(c: sqlite3.Connection, task_id: int | None) -> int | None:
+            if task_id is None:
+                return None
+            row = c.execute("SELECT attempt FROM tasks WHERE id=?", (task_id,)).fetchone()
+            return int(row["attempt"]) if row else None
+
+        def record_grant(
+            c: sqlite3.Connection,
+            r: Any,
+            kind: str,
+            now: str,
+            *,
+            details: dict[str, Any],
+            purpose: str | None = None,
+            extra: float | None = None,
+            attempts: int | None = None,
+            expires: str | None = None,
+        ) -> None:
+            """The grant, scoped to its objective, task, request and attempt. At most one
+            grant per request exists (unique index): a request is never consumed twice."""
+            try:
+                c.execute(
+                    "INSERT INTO approvals (kind, scope, details, max_usd, granted_at,"
+                    " expires_at, objective_id, task_id, request_id, attempt, purpose,"
+                    " extra_usd, extra_attempts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        kind,
+                        f"objective:{r['objective_id']}/task:{r['task_id']}"
+                        + (f"/{purpose}" if purpose else ""),
+                        to_json({"request_id": request_id, "simulated": True, **details}),
+                        extra,
+                        now,
+                        expires,
+                        r["objective_id"],
+                        r["task_id"],
+                        request_id,
+                        scope_attempt(c, r["task_id"]),
+                        purpose,
+                        extra,
+                        attempts,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise CareerOSError(f"Approval request {request_id} was already granted") from exc
+
         def downgrade(c: sqlite3.Connection, r: Any) -> None:
             kind, obj_id, task_id = r["kind"], r["objective_id"], r["task_id"]
             details = from_json(r["details"], {})
@@ -2623,24 +2774,23 @@ class CareerManager:
                 raise CareerOSError(f"Downgrades cannot be approved for {purpose} routing.")
             column = "approved_floor" if purpose == "task" else "approved_review_floor"
             floor_to = float(option["p_accept"])
-            now = utc_now_iso()
+            now = self._now()
             self._resolve_in(c, request_id, "approved", f"accept_downgrade:{purpose}", now)
-            c.execute(
-                "INSERT INTO approvals (kind, scope, details, granted_at) VALUES (?,?,?,?)",
-                (
-                    "quality_downgrade",
-                    f"objective:{obj_id}/task:{task_id}/{purpose}",
-                    to_json(
-                        {
-                            "request_id": request_id,
-                            "route_purpose": purpose,
-                            "floor_from": details.get("quality_floor"),
-                            "floor_to": floor_to,
-                            "option": option,
-                        }
-                    ),
-                    now,
-                ),
+            # Scoped to this task, this routing purpose and the attempt it was asked for
+            # (the blocked attempt stays open), and expiring: routing uses it only then.
+            record_grant(
+                c,
+                r,
+                "quality_downgrade",
+                now,
+                details={
+                    "route_purpose": purpose,
+                    "floor_from": details.get("quality_floor"),
+                    "floor_to": floor_to,
+                    "option": option,
+                },
+                purpose=purpose,
+                expires=self._hours_from_now(limits.downgrade_ttl_hours),
             )
             self._release_task_in(c, task_id, kind, now, column, max(0.0, floor_to - 1e-9))
             self._reopen_in(c, obj_id, now)
@@ -2660,21 +2810,64 @@ class CareerManager:
 
         def grant(c: sqlite3.Connection, r: Any) -> None:
             kind, obj_id, task_id = r["kind"], r["objective_id"], r["task_id"]
-            if kind == "budget_increase" and extra_usd <= 0:
-                raise CareerOSError("A budget approval needs a positive simulated amount.")
-            if kind == "clarification":
+            now = self._now()
+            if kind == "budget_increase":
+                if extra_usd <= 0:
+                    raise CareerOSError("A budget approval needs a positive simulated amount.")
+                if extra_usd > limits.max_budget_increase_usd + 1e-12:
+                    raise CareerOSError(
+                        f"${extra_usd:.2f} exceeds the per-approval limit of "
+                        f"${limits.max_budget_increase_usd:.2f} (approvals.max_budget_increase_usd)"
+                    )
+                granted = float(
+                    c.execute(
+                        "SELECT COALESCE(SUM(extra_usd), 0) FROM approvals"
+                        " WHERE kind='budget_increase' AND objective_id=? AND revoked_at IS NULL",
+                        (obj_id,),
+                    ).fetchone()[0]
+                )
+                if granted + extra_usd > limits.max_total_budget_increase_usd + 1e-12:
+                    raise CareerOSError(
+                        f"${extra_usd:.2f} would bring this objective's approved increases to "
+                        f"${granted + extra_usd:.2f}, over the limit of "
+                        f"${limits.max_total_budget_increase_usd:.2f}"
+                        " (approvals.max_total_budget_increase_usd)"
+                    )
+            elif kind == "retry_limit":
+                if not 1 <= extra_attempts <= limits.max_extra_attempts:
+                    raise CareerOSError(
+                        f"{extra_attempts} extra attempt(s) is outside "
+                        f"1..{limits.max_extra_attempts} (approvals.max_extra_attempts)"
+                    )
+                granted_n = int(
+                    c.execute(
+                        "SELECT COALESCE(SUM(extra_attempts), 0) FROM approvals"
+                        " WHERE kind='extra_attempts' AND task_id=? AND revoked_at IS NULL",
+                        (task_id,),
+                    ).fetchone()[0]
+                )
+                if granted_n + extra_attempts > limits.max_total_extra_attempts:
+                    raise CareerOSError(
+                        f"task {task_id} already has {granted_n} approved extra attempt(s); the "
+                        f"limit is {limits.max_total_extra_attempts}"
+                        " (approvals.max_total_extra_attempts)"
+                    )
+            elif kind == "clarification":
                 if not (answer and answer.strip()):
                     raise CareerOSError("A clarification needs an answer (--answer).")
-                c.execute(
-                    "UPDATE approval_requests SET answer=? WHERE id=?",
-                    (answer.strip(), request_id),
-                )
-                if task_id is not None:  # planning resumes in a new attempt with the answer
+                answered = int(
                     c.execute(
-                        "UPDATE tasks SET max_attempts = max_attempts + 1 WHERE id=?",
-                        (task_id,),
+                        "SELECT COUNT(*) FROM approval_requests WHERE objective_id=?"
+                        " AND kind='clarification' AND status='approved' AND answer IS NOT NULL",
+                        (obj_id,),
+                    ).fetchone()[0]
+                )
+                if answered >= limits.max_clarifications:
+                    raise CareerOSError(
+                        f"objective {obj_id} has had {answered} clarification(s), the limit"
+                        f" ({limits.max_clarifications}, approvals.max_clarifications);"
+                        " deny the request or choose a playbook"
                     )
-            now = utc_now_iso()
             self._resolve_in(
                 c,
                 request_id,
@@ -2682,18 +2875,21 @@ class CareerManager:
                 "budget_increase" if kind == "budget_increase" else "approved",
                 now,
             )
-            c.execute(
-                "INSERT INTO approvals (kind, scope, details, max_usd, granted_at)"
-                " VALUES (?,?,?,?,?)",
-                (
-                    "budget_increase" if kind == "budget_increase" else "other",
-                    f"objective:{obj_id}/task:{task_id}",
-                    to_json({"request_id": request_id, "simulated": True, "kind": kind}),
-                    extra_usd or None,
-                    now,
-                ),
-            )
-            if kind == "budget_increase":
+            if kind == "clarification":
+                # An answer, not a permission: stored with the request; no grant row.
+                c.execute(
+                    "UPDATE approval_requests SET answer=? WHERE id=?",
+                    (answer.strip() if answer else None, request_id),
+                )
+                if task_id is not None:  # planning resumes in a new attempt with the answer
+                    c.execute(
+                        "UPDATE tasks SET max_attempts = max_attempts + 1 WHERE id=?",
+                        (task_id,),
+                    )
+            elif kind == "budget_increase":
+                record_grant(c, r, "budget_increase", now, details={}, extra=extra_usd)
+                # Only this objective's and this task's own lines rise; session and monthly
+                # lines (the global limits) are untouched and still bound every reservation.
                 c.execute(
                     "UPDATE objectives SET budget_usd = COALESCE(budget_usd, 0) + ? WHERE id=?",
                     (extra_usd, obj_id),
@@ -2706,10 +2902,13 @@ class CareerManager:
                     )
                     self.budgets.raise_limit_in(c, "task", str(task_id), extra_usd)
             elif kind == "retry_limit" and task_id is not None:
+                record_grant(c, r, "extra_attempts", now, details={}, attempts=extra_attempts)
                 c.execute(
                     "UPDATE tasks SET max_attempts = max_attempts + ? WHERE id=?",
                     (extra_attempts, task_id),
                 )
+            else:
+                record_grant(c, r, "other", now, details={"kind": kind})
             if task_id is not None:
                 self._release_task_in(c, task_id, kind, now)
             self._reopen_in(c, obj_id, now)

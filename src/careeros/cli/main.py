@@ -170,9 +170,10 @@ def approvals(config_dir: ConfigDirOpt = None) -> None:
         if not pending:
             typer.echo("No pending requests.")
         for r in pending:
+            expiry = "EXPIRED" if r["expired"] else f"expires {r['expires_at']}"
             typer.echo(
                 f"#{r['id']} objective {r['objective_id']} task {r['task_id']} "
-                f"[{r['kind']}]: {r['details'].get('reason') or r['details']}"
+                f"[{r['kind']}] ({expiry}): {r['details'].get('reason') or r['details']}"
             )
 
 

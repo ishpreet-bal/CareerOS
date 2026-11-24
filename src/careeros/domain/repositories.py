@@ -902,11 +902,24 @@ class OrchestrationRepository:
         task_id: int | None,
         kind: str,
         details: dict[str, Any],
+        *,
+        created_at: str | None = None,
+        expires_at: str | None = None,
     ) -> int:
+        """A request for the user's decision. ``expires_at`` is its explicit expiry (audit
+        L12); requests without one (older rows) expire one configured lifetime after
+        ``created_at``."""
         cur = c.execute(
-            "INSERT INTO approval_requests (objective_id, task_id, kind, details, created_at)"
-            " VALUES (?,?,?,?,?)",
-            (objective_id, task_id, kind, to_json(details), utc_now_iso()),
+            "INSERT INTO approval_requests (objective_id, task_id, kind, details, created_at,"
+            " expires_at) VALUES (?,?,?,?,?,?)",
+            (
+                objective_id,
+                task_id,
+                kind,
+                to_json(details),
+                created_at or utc_now_iso(),
+                expires_at,
+            ),
         )
         assert cur.lastrowid is not None
         return cur.lastrowid

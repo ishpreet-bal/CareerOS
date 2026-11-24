@@ -602,7 +602,7 @@ def test_migration_backfills_plan_association_dependencies_and_one_current_plan(
     )
     db.close()
     with Database.open(path, dataset_kind="synthetic") as db2:
-        assert db2.schema_version() == 6
+        assert db2.schema_version() == max(m.version for m in dbmod.load_migrations())
         current = db2.query("SELECT id FROM plans WHERE superseded_at IS NULL")
         assert [r["id"] for r in current] == [3]
         assert {r["plan_id"] for r in db2.query("SELECT plan_id FROM tasks")} == {3}
@@ -628,10 +628,12 @@ def test_legacy_objective_without_a_plan_is_planned_on_resume(
             "'[\"accepted:all_required\"]',2.0,?,?,?)",
             (oid, TITLE, json.dumps(INPUTS), status, NOW, NOW),
         )
-    db.conn.execute(
+    from careeros.core.clock import utc_now_iso
+
+    db.conn.execute(  # a recent request (an old one would have expired: C6, audit L12)
         "INSERT INTO approval_requests (id, objective_id, kind, details, status, created_at)"
         " VALUES (7,2,'clarification','{}','pending',?)",
-        (NOW,),
+        (utc_now_iso(),),
     )
     db.close()
     with open_context_at(cfg, data_dir) as ctx:

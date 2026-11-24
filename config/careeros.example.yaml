@@ -19,6 +19,23 @@ budgets:
   default_task_usd: 0.25
   session_simulated_usd: 2.00   # cap per run/resume invocation
 
+approvals:
+  # How long a request for your decision stays open (hours). An expired request is
+  # withdrawn and, if the work is still waiting, replaced by a fresh one.
+  request_ttl_hours: 72
+  # A quality-downgrade grant applies only to the attempt it was approved for, and only
+  # for this long (default: request_ttl_hours).
+  downgrade_ttl_hours: null
+  # Limits on what approvals may authorise. null = derived from settings above:
+  max_budget_increase_usd: null        # per request; default budgets.default_objective_usd
+  max_total_budget_increase_usd: null  # all grants for one objective; default
+                                       #   budgets.simulated_monthly_usd
+  max_extra_attempts: null             # per request; default limits.max_attempts
+  max_total_extra_attempts: null       # all grants for one task; default limits.max_attempts
+  max_clarifications: null             # answered planning questions per objective;
+                                       #   default limits.max_attempts
+  # Approvals never raise the session or monthly budget lines.
+
 limits:
   max_attempts: 3
   max_escalations: 2
