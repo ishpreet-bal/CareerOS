@@ -128,6 +128,11 @@ def build_report(db: Database, objective_id: int) -> CostReport:
         key = f"tier {c.tier} ({c.model_id})"
         by_tier[key] = by_tier.get(key, 0.0) + c.cost_usd
     est_total = sum(c.est_cost_usd for c in calls if c.status != "cache_hit")
+    late = db.query_one(
+        "SELECT COUNT(*) AS n, SUM(l.adjustment_usd) AS adj FROM late_replies l"
+        " JOIN model_calls m ON m.id = l.call_id WHERE m.objective_id=?",
+        (objective_id,),
+    )
     decisions = {
         r["decision"]: r["n"]
         for r in db.query(
@@ -155,6 +160,8 @@ def build_report(db: Database, objective_id: int) -> CostReport:
             ),
             "overshoot_usd": sum(float(c["overshoot_usd"] or 0.0) for c in crows),
             "overshoot_calls": sum(1 for c in crows if (c["overshoot_usd"] or 0.0) > 0),
+            "late_replies": late["n"] if late else 0,
+            "late_adjustment_usd": float(late["adj"] or 0.0) if late else 0.0,
             "model_calls": len(calls),
             "cache_hits": sum(1 for c in calls if c.status == "cache_hit"),
             "abandoned_calls": sum(1 for c in calls if c.status == "abandoned"),
@@ -217,7 +224,8 @@ def format_report(rep: CostReport) -> str:
         f"  estimated before calls {_usd(t['estimated_cost_usd'])}; worst case reserved "
         f"{_usd(t['reserved_usd'])}; budget {_usd(t['budget_usd'])}",
         f"  overshoot beyond reservations {_usd(t['overshoot_usd'])} "
-        f"({t['overshoot_calls']} call(s))",
+        f"({t['overshoot_calls']} call(s)); late replies {t['late_replies']} "
+        f"(reconciliation {t['late_adjustment_usd']:+.5f})",
         f"  spent on failed/rejected attempts {_usd(t['wasted_cost_usd'])}",
         f"  calls {t['model_calls']} (abandoned {t['abandoned_calls']}), cache hits "
         f"{t['cache_hits']}, retries {t['retries']}, "

@@ -25,6 +25,16 @@ class NotFoundError(CareerOSError):
     """A requested record does not exist."""
 
 
+class OwnershipLostError(CareerOSError):
+    """A write was attempted with a fencing token that is no longer the task's current
+    owner (taken over, lease expired, task finished). The write was rolled back."""
+
+
+class SessionHaltedError(CareerOSError):
+    """The session stopped its own workers because it could not renew its leases safely
+    (heartbeat failure). Work is left for recovery; nothing is lost."""
+
+
 class SessionTerminatedError(CareerOSError):
     """The execution session is ending abruptly (e.g. the process is being killed).
 

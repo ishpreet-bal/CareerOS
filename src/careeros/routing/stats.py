@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from careeros.core.clock import utc_now_iso
 from careeros.core.db import Database
@@ -45,31 +46,61 @@ class RoutingStatsRepository:
         latency_ms: int,
     ) -> None:
         """Fold one reviewed attempt into running averages."""
-        q = quality if quality is not None else (1.0 if accepted else 0.0)
         with self.db.transaction() as c:
-            c.execute(
-                "INSERT INTO routing_stats (task_type, complexity_bucket, model_id, effort,"
-                " attempts, accepts, prior_alpha, prior_beta, avg_quality, avg_cost_usd,"
-                " avg_latency_ms, updated_at) VALUES (?,?,?,?,1,?,?,?,?,?,?,?)"
-                " ON CONFLICT(task_type, complexity_bucket, model_id, effort) DO UPDATE SET"
-                " avg_quality = (avg_quality * attempts + excluded.avg_quality) / (attempts + 1),"
-                " avg_cost_usd = (avg_cost_usd * attempts + excluded.avg_cost_usd)"
-                "   / (attempts + 1),"
-                " avg_latency_ms = (avg_latency_ms * attempts + excluded.avg_latency_ms)"
-                "   / (attempts + 1),"
-                " attempts = attempts + 1, accepts = accepts + excluded.accepts,"
-                " updated_at = excluded.updated_at",
-                (
-                    task_type,
-                    bucket,
-                    model_id,
-                    effort,
-                    int(accepted),
-                    prior_alpha,
-                    prior_beta,
-                    q,
-                    cost_usd,
-                    latency_ms,
-                    utc_now_iso(),
-                ),
+            self.record_in(
+                c,
+                task_type,
+                bucket,
+                model_id,
+                effort,
+                accepted=accepted,
+                prior_alpha=prior_alpha,
+                prior_beta=prior_beta,
+                quality=quality,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
             )
+
+    @staticmethod
+    def record_in(
+        c: Any,
+        task_type: str,
+        bucket: str,
+        model_id: str,
+        effort: str,
+        *,
+        accepted: bool,
+        prior_alpha: float,
+        prior_beta: float,
+        quality: float | None,
+        cost_usd: float,
+        latency_ms: int,
+    ) -> None:
+        """Inside the caller's transaction (the fenced attempt outcome)."""
+        q = quality if quality is not None else (1.0 if accepted else 0.0)
+        c.execute(
+            "INSERT INTO routing_stats (task_type, complexity_bucket, model_id, effort,"
+            " attempts, accepts, prior_alpha, prior_beta, avg_quality, avg_cost_usd,"
+            " avg_latency_ms, updated_at) VALUES (?,?,?,?,1,?,?,?,?,?,?,?)"
+            " ON CONFLICT(task_type, complexity_bucket, model_id, effort) DO UPDATE SET"
+            " avg_quality = (avg_quality * attempts + excluded.avg_quality) / (attempts + 1),"
+            " avg_cost_usd = (avg_cost_usd * attempts + excluded.avg_cost_usd)"
+            "   / (attempts + 1),"
+            " avg_latency_ms = (avg_latency_ms * attempts + excluded.avg_latency_ms)"
+            "   / (attempts + 1),"
+            " attempts = attempts + 1, accepts = accepts + excluded.accepts,"
+            " updated_at = excluded.updated_at",
+            (
+                task_type,
+                bucket,
+                model_id,
+                effort,
+                int(accepted),
+                prior_alpha,
+                prior_beta,
+                q,
+                cost_usd,
+                latency_ms,
+                utc_now_iso(),
+            ),
+        )

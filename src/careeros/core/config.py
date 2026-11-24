@@ -102,10 +102,37 @@ class LimitsConfig(_Strict):
     max_retries_transient: int = Field(default=2, ge=0, le=5)
     max_tasks_per_objective: int = Field(default=100, ge=1)
     task_timeout_seconds: int = Field(default=300, ge=1)
-    lease_seconds: int = Field(default=120, ge=10)
-    #: How often a live session renews its task leases (default: a third of the lease).
+    #: Lease duration for a claimed task (seconds). Small values are for tests only.
+    lease_seconds: float = Field(default=120, ge=1)
+    #: How often a live session renews its task leases (default: lease / 6, i.e. 20 s).
     heartbeat_seconds: float | None = Field(default=None, gt=0)
+    #: A session halts its own workers once ``halt_after = lease - safety_margin`` seconds
+    #: pass without a successful renewal (default margin: 2 heartbeat intervals = 40 s, so
+    #: halt_after = 80 s), well before any lease it holds can expire.
+    lease_safety_margin_seconds: float | None = Field(default=None, gt=0)
+    #: Immediate retries of a failed lease renewal (with short backoff) before waiting for
+    #: the next heartbeat interval.
+    heartbeat_retries: int = Field(default=2, ge=0, le=10)
     research: ResearchLimits = ResearchLimits()
+
+    def heartbeat_interval(self) -> float:
+        return self.heartbeat_seconds or self.lease_seconds / 6
+
+    def safety_margin(self) -> float:
+        return self.lease_safety_margin_seconds or 2 * self.heartbeat_interval()
+
+    def halt_after(self) -> float:
+        return self.lease_seconds - self.safety_margin()
+
+    @model_validator(mode="after")
+    def _lease_timing(self) -> LimitsConfig:
+        if self.halt_after() <= self.heartbeat_interval():
+            raise ValueError(
+                "lease timing: halt_after (lease - safety margin) must exceed the heartbeat "
+                f"interval; got lease={self.lease_seconds}, interval="
+                f"{self.heartbeat_interval()}, margin={self.safety_margin()}"
+            )
+        return self
 
 
 class EligibilityRule(_Strict):

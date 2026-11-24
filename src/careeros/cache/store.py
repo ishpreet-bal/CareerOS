@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import timedelta
+from typing import Any
 
 from careeros.core.clock import utc_now, utc_now_iso
 from careeros.core.db import Database, to_json
@@ -48,9 +49,13 @@ class CacheStore:
 
     def put(self, key: str, value: str, kind: str = "model_response") -> None:
         with self.db.transaction() as c:
-            c.execute(
-                "INSERT INTO cache_entries (key, kind, value, created_at, expires_at)"
-                " VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
-                " expires_at=excluded.expires_at",
-                (key, kind, value, utc_now_iso(), (utc_now() + self.ttl).isoformat()),
-            )
+            self.put_in(c, key, value, kind)
+
+    def put_in(self, c: Any, key: str, value: str, kind: str = "model_response") -> None:
+        """Write inside the caller's transaction (e.g. a fenced accept)."""
+        c.execute(
+            "INSERT INTO cache_entries (key, kind, value, created_at, expires_at)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+            " expires_at=excluded.expires_at",
+            (key, kind, value, utc_now_iso(), (utc_now() + self.ttl).isoformat()),
+        )

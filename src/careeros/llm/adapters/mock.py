@@ -64,6 +64,7 @@ class MockAdapter:
     provider: ClassVar[str] = "mock"
     offline: ClassVar[bool] = True
     mode_label: ClassVar[str] = "mock"
+    supports_provider_idempotency: ClassVar[bool] = False
 
     def map_effort(self, effort: Effort) -> dict[str, Any]:
         return {"simulated_effort": effort, "thinking_multiplier": _EFFORT_THINKING[effort]}
@@ -121,12 +122,17 @@ class MockAdapter:
             request.max_output_tokens, round(visible * _EFFORT_THINKING[request.effort])
         )
         latency = round(sim.base_latency_ms + sim.ms_per_output_token * output_tokens)
+        capped = output_tokens >= request.max_output_tokens
+        rid_src = f"{profile.id}|{request.client_request_id or request.seed_salt}|{request.prompt}"
+        rid = hashlib.sha256(rid_src.encode()).hexdigest()[:16]
         return ModelResponse(
             text=text,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             latency_ms=latency,
+            finish_reason="length" if capped else "stop",
             simulation={"sim_quality": round(quality, 4), "outcome": outcome.kind},
+            provider_request_id=f"mock-{rid}",
         )
 
     # ------------------------------------------------------------------ internals

@@ -20,6 +20,10 @@ class ModelAdapter(Protocol):
     provider: ClassVar[str]
     #: True only for adapters that never touch the network and never cost money.
     offline: ClassVar[bool]
+    # Optional (read with getattr, default False): whether the provider de-duplicates
+    # requests by ``ModelRequest.client_request_id``. Provider-side idempotency is an
+    # extra safety net only; CareerOS's correctness never depends on it.
+    #     supports_provider_idempotency: ClassVar[bool]
 
     def call(self, profile: ModelProfile, request: ModelRequest) -> ModelResponse:
         """Execute one request. Raises ``ModelError`` subclasses on failure."""

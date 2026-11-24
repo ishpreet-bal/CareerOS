@@ -1,0 +1,253 @@
+"""Entry points for separate-process tests (spawn start method).
+
+Each function runs in its own operating-system process with its own interpreter and its
+own SQLite connections, against a shared data directory. Results go back through a queue.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import traceback
+from datetime import timedelta
+from pathlib import Path
+from typing import Any, ClassVar
+
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+
+
+def _ctx(data_dir: str, limits: dict[str, Any] | None = None) -> Any:
+    os.environ["CAREEROS_DATA_DIR"] = data_dir
+    from careeros.context import open_context
+    from careeros.core.config import load_config
+
+    cfg = load_config(CONFIG_DIR)
+    if limits:
+        cfg = cfg.model_copy(update={"limits": cfg.limits.model_copy(update=limits)})
+    return open_context(cfg)
+
+
+def _library(book: dict[str, Any] | None) -> Any:
+    from careeros.manager.plans import Playbook, PlaybookLibrary
+
+    return PlaybookLibrary([Playbook.model_validate(book)]) if book else None
+
+
+def _clock(offset_minutes: float) -> Any:
+    from careeros.core.clock import utc_now
+
+    return lambda: utc_now() + timedelta(minutes=offset_minutes)
+
+
+def _manager(
+    c: Any,
+    book: dict[str, Any] | None,
+    *,
+    offset: float = 0.0,
+    adapter: Any = None,
+    fault_hook: Any = None,
+) -> Any:
+    from careeros.manager.manager import CareerManager
+
+    kw: dict[str, Any] = {"clock": _clock(offset)}
+    lib = _library(book)
+    if lib is not None:
+        kw["playbooks"] = lib
+    if adapter is not None:
+        kw["adapter"] = adapter
+    if fault_hook is not None:
+        kw["fault_hook"] = fault_hook
+    return CareerManager(c, **kw)
+
+
+def _blocking_adapter(steps: list[str], entered: Any, release: Any, timeout: float) -> Any:
+    from careeros.llm.adapters.mock import MockAdapter
+
+    class MPBlockingAdapter(MockAdapter):
+        mode_label: ClassVar[str] = "mock"
+
+        def call(self, profile: Any, request: Any) -> Any:
+            step = request.simulation.get("step")
+            if step in steps and request.task_type != "quality.review":
+                steps.remove(step)
+                entered.set()
+                release.wait(timeout)
+            return super().call(profile, request)
+
+    return MPBlockingAdapter()
+
+
+def _report(out: Any, **data: Any) -> None:
+    out.put({"pid": os.getpid(), **data})
+
+
+# ---------------------------------------------------------------------- entry points
+def claim_task(data_dir: str, task_id: int, barrier: Any, out: Any) -> None:
+    try:
+        with _ctx(data_dir) as c:
+            m = _manager(c, None)
+            sid = c.orchestration.start_session()
+            task = c.orchestration.get_task(task_id)
+            barrier.wait(30)
+            fence = m._claim(task, sid)
+            _report(out, fence=None if fence is None else (fence.generation, fence.attempt))
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def recover_once(
+    data_dir: str, objective_id: int, book: dict[str, Any], offset: float, barrier: Any, out: Any
+) -> None:
+    try:
+        with _ctx(data_dir) as c:
+            m = _manager(c, book, offset=offset)
+            sid = c.orchestration.start_session()
+            barrier.wait(30)
+            m._recover(objective_id, sid)
+            _report(out, ok=True)
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def run_objective(
+    data_dir: str,
+    objective_id: int,
+    book: dict[str, Any] | None,
+    out: Any,
+    offset: float = 0.0,
+    force: bool = False,
+    limits: dict[str, Any] | None = None,
+) -> None:
+    try:
+        with _ctx(data_dir, limits) as c:
+            s = _manager(c, book, offset=offset).run(objective_id, force_recover=force)
+            _report(out, status=s.status.value, stop_reason=s.stop_reason)
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def run_blocking(
+    data_dir: str,
+    objective_id: int,
+    book: dict[str, Any],
+    steps: list[str],
+    entered: Any,
+    release: Any,
+    out: Any,
+    timeout: float = 20.0,
+    limits: dict[str, Any] | None = None,
+    fail_renewals: bool = False,
+) -> None:
+    """Run an objective whose model call for ``steps`` blocks until ``release``."""
+    try:
+        with _ctx(data_dir, limits) as c:
+            if fail_renewals:  # simulated database outage for the heartbeat only
+                from careeros.manager.manager import CareerManager
+
+                CareerManager._renew_leases = lambda self, db, s, st: False  # type: ignore[method-assign]
+            m = _manager(c, book, adapter=_blocking_adapter(steps, entered, release, timeout))
+            s = m.run(objective_id)
+            _report(
+                out,
+                status=s.status.value,
+                stop_reason=s.stop_reason,
+                lease_lost=m._lease_lost.is_set(),
+            )
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def try_steal(
+    data_dir: str, objective_id: int, book: dict[str, Any], seconds: float, out: Any
+) -> None:
+    """Repeatedly attempt recovery with an honest clock for ``seconds``."""
+    try:
+        with _ctx(data_dir) as c:
+            m = _manager(c, book)
+            sid = c.orchestration.start_session()
+            deadline = time.monotonic() + seconds
+            n = 0
+            while time.monotonic() < deadline:
+                m._recover(objective_id, sid)
+                n += 1
+                time.sleep(0.1)
+            _report(out, attempts=n)
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def stale_owner(
+    data_dir: str, objective_id: int, book: dict[str, Any], claimed: Any, proceed: Any, out: Any
+) -> None:
+    """Claim the task, pause (as if the process were frozen), then try to write."""
+    try:
+        from careeros.core.errors import OwnershipLostError
+        from careeros.llm.contracts import ModelRequest, OutputSchema
+        from careeros.llm.gateway import CallContext
+
+        with _ctx(data_dir) as c:
+            m = _manager(c, book)
+            sid = c.orchestration.start_session()
+            task = c.orchestration.list_tasks(objective_id)[0]
+            obj = c.orchestration.get_objective(objective_id)
+            fence = m._claim(task, sid)
+            claimed.set()
+            proceed.wait(60)
+            outcomes = {}
+            attempts = {
+                "accept": lambda: m._accept(fence, obj, task, 1, "stale accept"),
+                "requeue": lambda: m._requeue(fence, task, "stale requeue"),
+                "block": lambda: m._block(fence, obj, task, "budget_increase", {"reason": "stale"}),
+                "model_call": lambda: m.gateway.call(
+                    "mock-small",
+                    ModelRequest(
+                        task_type="job.classify_role",
+                        prompt="x",
+                        output_schema=OutputSchema(("role_family",)),
+                    ),
+                    CallContext(objective_id, task.id, 1, "task", sid, "stale:key", fence),
+                ),
+            }
+            for name, op in attempts.items():
+                try:
+                    op()
+                    outcomes[name] = "WRITTEN"
+                except OwnershipLostError:
+                    outcomes[name] = "rejected"
+            _report(out, fence=(fence.generation, fence.attempt), outcomes=outcomes)
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def block_then_die(
+    data_dir: str, objective_id: int, step: str, entered: Any, release: Any, out: Any
+) -> None:
+    """Block inside ``step``'s model call until ``release`` (so other processes can work
+    concurrently), then die abruptly (os._exit) right after the reply - no cleanup, no
+    session end, other worker threads killed mid-flight."""
+    try:
+        with _ctx(data_dir) as c:
+
+            def die(point: str, task: Any) -> None:
+                if point == "after_model_response" and task.step == step:
+                    _report(out, died_at=step)
+                    time.sleep(0.2)  # let the queue flush
+                    os._exit(17)
+
+            adapter = _blocking_adapter([step], entered, release, 60.0)
+            _manager(c, None, adapter=adapter, fault_hook=die).run(objective_id)
+            _report(out, status="finished-without-dying")
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def open_fresh(path: str, barrier: Any, out: Any) -> None:
+    """Open (and so initialise and migrate) a brand-new database concurrently."""
+    try:
+        from careeros.core.db import Database
+
+        barrier.wait(30)
+        with Database.open(Path(path), dataset_kind="synthetic") as db:
+            _report(out, version=db.schema_version(), kind=db.dataset_kind)
+    except BaseException:
+        _report(out, error=traceback.format_exc())

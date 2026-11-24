@@ -1,6 +1,6 @@
 # CareerOS — Architecture & Implementation Plan (v3)
 
-Status: **APPROVED (with amendments in §0).** M0–M3 implemented, plus Phase A audit fixes (§17); M4+ await approval.
+Status: **APPROVED (with amendments in §0).** M0–M3 implemented, plus Phase A (§17) and Phase B (§18) audit fixes; M4+ await approval.
 Nothing is deployed, purchased or configured against a paid service.
 
 ---
@@ -23,6 +23,7 @@ These decisions override anything below that conflicts with them.
 | A10 | **M3 bounded concurrency (2026-11-23):** dependency-aware concurrent execution with a configurable worker limit (default 3), atomic budget reservations, exclusive task claims, idempotent model calls, lease-based recovery with multiple active workers. All model calls remain simulated. | §7, §16 |
 | A11 | **Storage stays offline-first (2026-11-23):** no external database, cloud storage, deployment or paid service. Keep a portable storage interface and document the path to durable storage. Synthetic data only. | §9.4, ADR 0005 |
 | A12 | **Phase A audit fixes (2026-11-23):** the A9 policy is enforced in every routing branch, including when learned history puts every option below the floor; no choice is ever below the task type's hard minimum. Reservations use the worst case at a hard output cap sent to the provider; any overshoot is recorded. Replans append to the skipped list atomically. Finishing an objective cancels unneeded tasks and withdraws pending requests in one transaction; obsolete approvals are rejected. Every downgrade (task, review, planning) is a `degrade` decision; approvals apply only to the routing step that asked. Lowered config budget limits apply immediately. | §5.4, §6.3, §17, ADR 0006 |
+| A13 | **Phase B ownership redesign (2026-11-24):** every claim mints a fencing token (task, owner generation, session, attempt); every task-owned write proves it inside its own write transaction; call completion is fenced; late replies are recorded and reconciled once; the heartbeat retries, and halts the session's workers at `halt_after = lease − safety margin`; every state transition commits with its decisions; attempts are never decremented (an open attempt is resumed); concurrent first-time migration is safe; replay checks model, effort and request. | §18, ADR 0007 |
 
 CareerOS is a standalone, local-first career intelligence and internship application agent.
 It shares no code, database, agents, infrastructure or modules with any other project. Ideas
@@ -1161,9 +1162,9 @@ overshoot_usd`, `tasks.approved_review_floor`, and the `withdrawn` request statu
 
 | Finding | Status |
 |---|---|
-| **H2** writes not fenced by lease ownership; late replies after takeover | Deferred to the ownership/recovery change (with M4, M5) |
-| **M4** heartbeat thread can die silently | Deferred (same change) |
-| **M5** multi-statement state transitions (`_block`, `_accept`, `_apply`, recovery) not atomic | Deferred (same change); `approve`, `deny`, `_finish` and `_prune` are now atomic |
+| **H2** writes not fenced by lease ownership; late replies after takeover | Fixed in Phase B (§18) |
+| **M4** heartbeat thread can die silently | Fixed in Phase B (§18) |
+| **M5** multi-statement state transitions (`_block`, `_accept`, `_apply`, recovery) not atomic | Fixed in Phase B (§18) |
 | L1–L12 (audit) | Unchanged except where noted above; see the audit report |
 
 ### 17.3 New behaviour to be aware of
@@ -1173,4 +1174,94 @@ overshoot_usd`, `tasks.approved_review_floor`, and the `withdrawn` request statu
 * A task whose best option falls below its hard minimum now stops and asks instead of
   running; with poor learned history this can happen for factual task types.
 * Raising a config budget limit does not raise an existing month's line.
+
+---
+
+## 18. Phase B — ownership, fencing, heartbeat and atomic transitions
+
+Fixes audit findings **H2, M4, M5, L1 and L4** (amendment A13, ADR 0007).
+
+### 18.1 Ownership model
+
+* **Fencing token** = `(task_id, owner_generation, session, attempt)`. A claim is one
+  conditional update that increments `tasks.owner_generation`, sets the lease, and starts a
+  new attempt only if the previous one is closed (`attempt_open = 0`); otherwise it resumes
+  the open attempt. Attempt numbers are never decremented.
+* **Fenced writes.** `orchestration.fencing.check_fence` runs first inside every task-owned
+  write transaction (`BEGIN IMMEDIATE`): `owner_generation`, `lease_owner`, `status='running'`
+  and `lease_expires_at > now` must all still match, or the transaction rolls back with
+  `OwnershipLostError`. This covers task state, route/degrade decisions, current model,
+  checkpoints, results (unique per task and attempt), reviews (unique per result), every
+  outcome decision, routing history, the result cache, replans and the call's T1.
+* **Atomic transitions.** `_accept` (with pruning, stats, cache), `_apply` (retry,
+  escalate or ask), `_block`, `_requeue`, deterministic failure, `_worker_failed`, the
+  prerequisite-failed skip and recovery takeover each commit as one transaction together
+  with their decisions and approval requests.
+
+### 18.2 Model calls and late replies
+
+* Idempotency keys identify the logical call: `task:<id>:a<attempt>:<purpose>:<seq>`. A
+  route checkpoint is saved before the call, so a resumed attempt replays the same logical
+  call; replay refuses a different model, effort or request fingerprint
+  (`IdempotencyMismatchError`).
+* **T2** (completion) checks, in one transaction, that the call is still `in_flight` and
+  the caller's token is still the live owner; only then is the reply recorded and the
+  reservation settled. Otherwise the reply is **late**: one `late_replies` row per call
+  (unique), and in the same transaction the call's charge is reconciled to the actual cost
+  once — a refund or extra charge against an abandoned call's conservative reservation
+  charge, or settlement of a still-held reservation — task spend is adjusted, overshoot
+  recorded and the adjustment marked applied. Duplicate delivery changes nothing. A late
+  reply is never used as a result and frees its idempotency key.
+* `provider_request_id` is stored when the provider reports one; `client_request_id`
+  (our local key) is passed to adapters, which may use provider-side de-duplication if they
+  declare `supports_provider_idempotency`. CareerOS's correctness never depends on it.
+
+### 18.3 Heartbeat and halting
+
+Defaults: lease 120 s, heartbeat every 20 s (`lease/6`), safety margin 40 s (2 intervals),
+so **`halt_after = lease − margin = 80 s`**. Each renewal retries (bounded) on database
+errors; a renewal never extends an already-expired lease. If no renewal succeeds for
+`halt_after`, or the heartbeat thread dies, the session stops claiming and its workers stop
+at their next checkpoint (`SessionHaltedError`), before any lease can expire; the session
+then ends as "halted: lease renewal failed". A database error alone is never treated as lost
+ownership.
+
+### 18.4 Recovery
+
+A task is taken over only if its lease has expired, its owning session has ended, or
+`--force-recover`. The takeover is one transaction conditional on the exact owner and
+generation (concurrent recoveries cannot both win): the task becomes ready with its attempt
+still open, that generation's in-flight calls are abandoned and charged their full
+reservation, its other held reservations are released, and a `recover` decision is
+written. A live session that keeps renewing cannot be taken over.
+
+### 18.5 Multiple processes and migrations
+
+Correctness lives in the database: exclusive claims, fenced transactions, conditional
+takeover and conditional completion; lock contention only delays a write, which is then
+checked. Migrations run statement by statement inside one `BEGIN IMMEDIATE` transaction that
+re-checks what is applied; the dataset kind is bound under the same lock; the WAL switch on a
+fresh file is retried. Assumptions: one host (shared clock), local filesystem (WAL is not
+safe on network filesystems).
+
+Migration `0005_phase_b_ownership.sql` adds `tasks.owner_generation/attempt_open`, audit
+generations on decisions, checkpoints and calls, `model_calls.request_hash/
+provider_request_id`, `late_replies`, unique (task, attempt) results and (task, result)
+reviews. It backfills open attempts from each task's status, last outcome decision and last
+approval request (running; budget-blocked; requeued/recovered; released by an approved
+budget request), archives duplicate results/reviews into `*_duplicates` tables instead of
+deleting them, and re-points reviews of archived results.
+
+### 18.6 Remaining limitations
+
+1. A call abandoned mid-flight may be repeated; with real providers that can cost twice,
+   bounded by the reservation and reconciled when a late reply arrives. True provider-side
+   idempotency is not assumed.
+2. Lease safety relies on one host's clock; multiple hosts would need clock-skew margins
+   or a lease service.
+3. A worker blocked inside a provider call cannot be interrupted; it stops at the next
+   checkpoint, and its reply is fenced (late) if ownership was lost meanwhile.
+4. `--force-recover` against a still-live process is safe for data (fenced) but wastes the
+   live process's in-flight work.
+5. SQLite: single writer; WAL requires a local filesystem.
 

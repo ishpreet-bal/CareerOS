@@ -315,7 +315,7 @@ def test_claim_is_exclusive_across_sessions(ctx: AppContext, cfg: AppConfig) -> 
             other = CareerManager(c2)
             sid = c2.orchestration.start_session()
             barrier.wait(timeout=5)
-            ok = other._claim(task, sid)
+            ok = other._claim(task, sid) is not None  # a fencing token, or None
             with lock:
                 wins.append(ok)
 
@@ -480,12 +480,17 @@ def test_heartbeat_renews_leases(ctx: AppContext) -> None:
     oid = _submit(m, "job_triage")
     task = ctx.orchestration.list_tasks(oid)[0]
     session = ctx.orchestration.start_session()
-    assert m._claim(task, session)
+    assert m._claim(task, session) is not None
     first = ctx.orchestration.get_task(task.id or 0).lease_expires_at
+    from careeros.manager.manager import LeaseState
+
     stop = threading.Event()
-    clock_offset = later(5)
-    m.clock = clock_offset
-    hb = threading.Thread(target=m._heartbeat, args=(session, stop, "synthetic"))
+    # 30 s later: still inside the 120 s lease, so the heartbeat must extend it. (A lease
+    # that has already expired is never resurrected - see the Phase B tests.)
+    m.clock = later(0.5)
+    hb = threading.Thread(
+        target=m._heartbeat, args=(session, stop, "synthetic", LeaseState(m.clock()))
+    )
     hb.start()
     threading.Event().wait(0.3)
     stop.set()

@@ -38,6 +38,10 @@ class ModelRequest:
     #: Hints for offline simulators only (e.g. true task difficulty). Real adapters
     #: must ignore this field.
     simulation: dict[str, Any] = field(default_factory=dict)
+    #: CareerOS's *local* idempotency key for this logical call. Adapters may forward it
+    #: to a provider that supports request de-duplication (see
+    #: ``ModelAdapter.supports_provider_idempotency``); CareerOS never relies on that.
+    client_request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,8 @@ class ModelResponse:
     finish_reason: str = "stop"
     #: Ground truth recorded by simulators (e.g. hidden quality); empty for real models.
     simulation: dict[str, Any] = field(default_factory=dict)
+    #: Identifier the provider assigned to this request, when it reports one.
+    provider_request_id: str | None = None
 
 
 # ------------------------------------------------------------------------------ errors
@@ -85,6 +91,11 @@ class ModelMalformedResponseError(ModelError):
     """The model returned text that is not the requested JSON."""
 
     kind = "malformed"
+
+
+class IdempotencyMismatchError(CareerOSError):
+    """A stored call with this idempotency key was made with a different model, effort or
+    request: replaying it would attribute a reply to the wrong call (audit L1)."""
 
 
 class RealExecutionBlockedError(CareerOSError):

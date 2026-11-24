@@ -388,41 +388,52 @@ class OrchestrationRepository:
         the previous list and the new steps. Concurrent prunes serialize on the write lock,
         so no update is lost and a skipped step can never become required again.
         """
-        now = utc_now_iso()
         with self.db.transaction() as c:
-            cur_plan = c.execute(
-                "SELECT * FROM plans WHERE objective_id=? AND superseded_at IS NULL",
-                (objective_id,),
-            ).fetchone()
-            if cur_plan is None:
-                raise NotFoundError(f"Objective {objective_id} has no current plan")
-            graph = from_json(cur_plan["graph"], {})
-            before = set(graph.get("skipped", []))
-            newly: list[str] = []
-            for tid, step in sorted(task_ids.items()):
-                changed = c.execute(
-                    "UPDATE tasks SET status='skipped', last_error=?, updated_at=?,"
-                    " finished_at=? WHERE id=? AND status IN"
-                    " ('pending','ready','retry_scheduled','blocked_budget','awaiting_human')",
-                    (f"pruned: {reason}"[:300], now, now, tid),
-                ).rowcount
-                if changed or step not in before:
-                    newly.append(step)
-            graph["skipped"] = sorted(before | set(task_ids.values()))
-            row = c.execute(
-                "SELECT COALESCE(MAX(version), 0) AS v FROM plans WHERE objective_id=?",
-                (objective_id,),
-            ).fetchone()
-            version = int(row["v"]) + 1
-            c.execute(
-                "UPDATE plans SET superseded_at=? WHERE objective_id=? AND superseded_at IS NULL",
-                (now, objective_id),
-            )
-            ins = c.execute(
-                "INSERT INTO plans (objective_id, version, source, rationale, graph, created_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (objective_id, version, cur_plan["source"], rationale, to_json(graph), now),
-            )
+            return self.skip_steps_in(c, objective_id, task_ids, rationale=rationale, reason=reason)
+
+    @staticmethod
+    def skip_steps_in(
+        c: sqlite3.Connection,
+        objective_id: int,
+        task_ids: dict[int, str],
+        *,
+        rationale: str,
+        reason: str,
+    ) -> tuple[Plan, list[str]]:
+        now = utc_now_iso()
+        cur_plan = c.execute(
+            "SELECT * FROM plans WHERE objective_id=? AND superseded_at IS NULL",
+            (objective_id,),
+        ).fetchone()
+        if cur_plan is None:
+            raise NotFoundError(f"Objective {objective_id} has no current plan")
+        graph = from_json(cur_plan["graph"], {})
+        before = set(graph.get("skipped", []))
+        newly: list[str] = []
+        for tid, step in sorted(task_ids.items()):
+            changed = c.execute(
+                "UPDATE tasks SET status='skipped', last_error=?, updated_at=?,"
+                " finished_at=? WHERE id=? AND status IN"
+                " ('pending','ready','retry_scheduled','blocked_budget','awaiting_human')",
+                (f"pruned: {reason}"[:300], now, now, tid),
+            ).rowcount
+            if changed or step not in before:
+                newly.append(step)
+        graph["skipped"] = sorted(before | set(task_ids.values()))
+        row = c.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM plans WHERE objective_id=?",
+            (objective_id,),
+        ).fetchone()
+        version = int(row["v"]) + 1
+        c.execute(
+            "UPDATE plans SET superseded_at=? WHERE objective_id=? AND superseded_at IS NULL",
+            (now, objective_id),
+        )
+        ins = c.execute(
+            "INSERT INTO plans (objective_id, version, source, rationale, graph, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (objective_id, version, cur_plan["source"], rationale, to_json(graph), now),
+        )
         plan = Plan(
             id=ins.lastrowid,
             objective_id=objective_id,
@@ -647,27 +658,53 @@ class OrchestrationRepository:
         effective_confidence: float | None = None,
     ) -> StoredResult:
         with self.db.transaction() as c:
-            cur = c.execute(
-                "INSERT INTO task_results (task_id, attempt, schema_version, status, output,"
-                " evidence, assumptions, confidence, effective_confidence, unresolved_questions,"
-                " recommended_next_steps, metrics, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    task_id,
-                    attempt,
-                    result.schema_version,
-                    result.status.value,
-                    to_json(result.output),
-                    to_json([e.model_dump(mode="json") for e in result.evidence]),
-                    to_json(result.assumptions),
-                    result.confidence,
-                    effective_confidence,
-                    to_json(result.unresolved_questions),
-                    to_json(result.recommended_next_steps),
-                    to_json(result.metrics),
-                    utc_now_iso(),
-                ),
+            return self.record_result_in(
+                c, task_id, attempt, result, effective_confidence=effective_confidence
             )
+
+    @staticmethod
+    def record_result_in(
+        c: sqlite3.Connection,
+        task_id: int,
+        attempt: int,
+        result: WorkerResult,
+        *,
+        effective_confidence: float | None = None,
+    ) -> StoredResult:
+        """One result per (task, attempt): a repeated insert returns the existing row."""
+        existing = c.execute(
+            "SELECT id, effective_confidence FROM task_results WHERE task_id=? AND attempt=?",
+            (task_id, attempt),
+        ).fetchone()
+        if existing is not None:
+            return StoredResult(
+                id=existing["id"],
+                task_id=task_id,
+                attempt=attempt,
+                result=result,
+                effective_confidence=existing["effective_confidence"],
+            )
+        cur = c.execute(
+            "INSERT INTO task_results (task_id, attempt, schema_version, status, output,"
+            " evidence, assumptions, confidence, effective_confidence, unresolved_questions,"
+            " recommended_next_steps, metrics, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                attempt,
+                result.schema_version,
+                result.status.value,
+                to_json(result.output),
+                to_json([e.model_dump(mode="json") for e in result.evidence]),
+                to_json(result.assumptions),
+                result.confidence,
+                effective_confidence,
+                to_json(result.unresolved_questions),
+                to_json(result.recommended_next_steps),
+                to_json(result.metrics),
+                utc_now_iso(),
+            ),
+        )
         assert cur.lastrowid is not None
         return StoredResult(
             id=cur.lastrowid,
@@ -708,18 +745,25 @@ class OrchestrationRepository:
     # ---------------------------------------------------------------- checkpoints
     def save_checkpoint(self, cp: Checkpoint) -> Checkpoint:
         with self.db.transaction() as c:
-            c.execute(
-                "INSERT INTO task_checkpoints (task_id, attempt, step, state, created_at)"
-                " VALUES (?,?,?,?,?) ON CONFLICT(task_id, attempt, step)"
-                " DO UPDATE SET state=excluded.state, created_at=excluded.created_at",
-                (cp.task_id, cp.attempt, cp.step, to_json(cp.state), utc_now_iso()),
-            )
+            self.save_checkpoint_in(c, cp)
         r = self.db.query_one(
             "SELECT * FROM task_checkpoints WHERE task_id=? AND attempt=? AND step=?",
             (cp.task_id, cp.attempt, cp.step),
         )
         assert r is not None
         return self._row_checkpoint(r)
+
+    @staticmethod
+    def save_checkpoint_in(
+        c: sqlite3.Connection, cp: Checkpoint, generation: int | None = None
+    ) -> None:
+        c.execute(
+            "INSERT INTO task_checkpoints (task_id, attempt, step, state, created_at,"
+            " owner_generation) VALUES (?,?,?,?,?,?) ON CONFLICT(task_id, attempt, step)"
+            " DO UPDATE SET state=excluded.state, created_at=excluded.created_at,"
+            " owner_generation=excluded.owner_generation",
+            (cp.task_id, cp.attempt, cp.step, to_json(cp.state), utc_now_iso(), generation),
+        )
 
     @staticmethod
     def _row_checkpoint(r: sqlite3.Row) -> Checkpoint:
@@ -749,10 +793,54 @@ class OrchestrationRepository:
         inputs: dict[str, Any] | None = None,
     ) -> int:
         with self.db.transaction() as c:
-            cur = c.execute(
-                "INSERT INTO manager_decisions (objective_id, task_id, decision, rationale,"
-                " inputs, created_at) VALUES (?,?,?,?,?,?)",
-                (objective_id, task_id, decision, rationale, to_json(inputs or {}), utc_now_iso()),
+            return self.record_decision_in(
+                c,
+                decision,
+                objective_id=objective_id,
+                task_id=task_id,
+                rationale=rationale,
+                inputs=inputs,
             )
+
+    @staticmethod
+    def record_decision_in(
+        c: sqlite3.Connection,
+        decision: str,
+        *,
+        objective_id: int | None = None,
+        task_id: int | None = None,
+        rationale: str | None = None,
+        inputs: dict[str, Any] | None = None,
+        generation: int | None = None,
+    ) -> int:
+        cur = c.execute(
+            "INSERT INTO manager_decisions (objective_id, task_id, decision, rationale,"
+            " inputs, created_at, owner_generation) VALUES (?,?,?,?,?,?,?)",
+            (
+                objective_id,
+                task_id,
+                decision,
+                rationale,
+                to_json(inputs or {}),
+                utc_now_iso(),
+                generation,
+            ),
+        )
+        assert cur.lastrowid is not None
+        return cur.lastrowid
+
+    @staticmethod
+    def request_user_in(
+        c: sqlite3.Connection,
+        objective_id: int,
+        task_id: int | None,
+        kind: str,
+        details: dict[str, Any],
+    ) -> int:
+        cur = c.execute(
+            "INSERT INTO approval_requests (objective_id, task_id, kind, details, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (objective_id, task_id, kind, to_json(details), utc_now_iso()),
+        )
         assert cur.lastrowid is not None
         return cur.lastrowid

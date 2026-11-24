@@ -1,9 +1,9 @@
-# Demonstration runs (M3 + Phase A fixes)
+# Demonstration runs (M3 + Phase A + Phase B)
 
 Generated with `careeros demo --scenario <name>` on a fresh synthetic database each time,
 with up to 3 concurrent workers (so event lines of parallel tasks interleave).
 All model calls are simulated by offline mock adapters; all costs are simulated USD.
-Reservations are worst case at each call's output cap (ADR 0006).
+Reservations are worst case at each call's output cap (ADR 0006); task writes are fenced (ADR 0007).
 
 ## Scenario: standard
 
@@ -13,16 +13,16 @@ Scenario 'standard' (all model calls simulated)
 Objective 1: 'Prepare application package for a synthetic posting' (exact playbook match for kind 'demo_application_package')
   plan v1 (playbook:demo_application_package): 7 steps in 5 waves; parallelizable groups: [['extract_keywords', 'research_company'], ['draft_cover_letter', 'tailor_resume']]
   [extract_keywords] ACCEPTED: deterministic extract_keywords: $0
-  [research_company] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01186 -> ok $0.00919
-  [research_company] ACCEPTED: mock-medium/low accepted
   [classify_role] attempt 1: mock-small (tier 3, effort none) p=0.97 est=$0.00021 -> ok $0.00021
   [classify_role] ACCEPTED: mock-small/none accepted
-  [tailor_resume] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01668 -> ok $0.01356
+  [research_company] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01186 -> ok $0.00919
+  [research_company] ACCEPTED: mock-medium/low accepted
   [draft_cover_letter] attempt 1: mock-medium (tier 2, effort medium) p=0.97 est=$0.01891 -> ok $0.01693
-  [tailor_resume] review by mock-large/low: accept score=0.91 ($0.02379)
-  [tailor_resume] ACCEPTED: mock-medium/low accepted (review 0.91)
+  [tailor_resume] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01668 -> ok $0.01356
   [draft_cover_letter] review by mock-large/low: accept score=0.83 ($0.02159)
   [draft_cover_letter] ACCEPTED: mock-medium/medium accepted (review 0.83)
+  [tailor_resume] review by mock-large/low: accept score=0.91 ($0.02379)
+  [tailor_resume] ACCEPTED: mock-medium/low accepted (review 0.91)
   [assemble] ACCEPTED: deterministic assemble_package: $0
   [strategic_review] attempt 1: mock-large (tier 1, effort high) p=0.97 est=$0.09452 -> ok $0.08642
   [strategic_review] ACCEPTED: mock-large/high accepted
@@ -32,12 +32,12 @@ Objective 1: Prepare application package for a synthetic posting  [done]   (ALL 
 
 Model calls:
     # step               purpose  att model        T effort status        in   out       est      cost     ms
-    1 research_company   task       1 mock-medium  2 low    ok           202   572  $0.01186  $0.00919   3932
-    2 classify_role      task       1 mock-small   3 none   ok           243   122  $0.00021  $0.00021    444
-    3 tailor_resume      task       1 mock-medium  2 low    ok           310   842  $0.01668  $0.01356   5552
-    4 draft_cover_letter task       1 mock-medium  2 medium ok           302  1068  $0.01891  $0.01693   6908
-    5 tailor_resume      review     1 mock-large   1 low    ok            96   298  $0.02957  $0.02379   4476
-    6 draft_cover_letter review     1 mock-large   1 low    ok            74   273  $0.02924  $0.02159   4176
+    1 classify_role      task       1 mock-small   3 none   ok           243   122  $0.00021  $0.00021    444
+    2 research_company   task       1 mock-medium  2 low    ok           202   572  $0.01186  $0.00919   3932
+    3 draft_cover_letter task       1 mock-medium  2 medium ok           302  1068  $0.01891  $0.01693   6908
+    4 tailor_resume      task       1 mock-medium  2 low    ok           310   842  $0.01668  $0.01356   5552
+    5 draft_cover_letter review     1 mock-large   1 low    ok            74   273  $0.02924  $0.02159   4176
+    6 tailor_resume      review     1 mock-large   1 low    ok            96   298  $0.02957  $0.02379   4476
     7 strategic_review   task       1 mock-large   1 high   ok           301  1092  $0.09452  $0.08642  14004
 
 Tasks:
@@ -53,7 +53,7 @@ Tasks:
 Totals (simulated USD):
   total $0.17168 = tasks $0.12630 + reviews $0.04537 + planning $0.00000
   estimated before calls $0.20097; worst case reserved $0.29773; budget $1.00000
-  overshoot beyond reservations $0.00000 (0 call(s))
+  overshoot beyond reservations $0.00000 (0 call(s)); late replies 0 (reconciliation +0.00000)
   spent on failed/rejected attempts $0.00000
   calls 7 (abandoned 0), cache hits 0, retries 0, escalations 0, deterministic steps 2
   downgrades 0, budget requeues 0, recovered tasks 0
@@ -70,24 +70,24 @@ Scenario 'escalation' (all model calls simulated)
 Objective 1: 'Prepare application package for a synthetic posting' (exact playbook match for kind 'demo_application_package')
   plan v1 (playbook:demo_application_package): 7 steps in 5 waves; parallelizable groups: [['extract_keywords', 'research_company'], ['draft_cover_letter', 'tailor_resume']]
   [extract_keywords] ACCEPTED: deterministic extract_keywords: $0
+  [research_company] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01186 -> timeout $0.00061
+  [research_company] timeout -> RETRY_SAME (transient timeout; retry with backoff)
   [classify_role] attempt 1: mock-small (tier 3, effort none) p=0.97 est=$0.00021 -> malformed $0.00013
   [classify_role] malformed -> RETRY_WITH_FEEDBACK (malformed output; one repair retry)
   [classify_role] attempt 2: mock-small (tier 3, effort none) p=0.78 est=$0.00022 -> ok $0.00023
   [classify_role] invalid -> ESCALATE_TIER (invalid output after a repair retry)
   [classify_role] attempt 3: mock-medium (tier 2, effort none) p=0.97 est=$0.00259 -> ok $0.00240
   [classify_role] ACCEPTED: mock-medium/none accepted
-  [research_company] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01186 -> timeout $0.00061
-  [research_company] timeout -> RETRY_SAME (transient timeout; retry with backoff)
   [research_company] attempt 2: mock-medium (tier 2, effort low) p=0.97 est=$0.01186 -> ok $0.01291
   [research_company] ACCEPTED: mock-medium/low accepted
+  [draft_cover_letter] attempt 1: mock-medium (tier 2, effort medium) p=0.97 est=$0.01891 -> ok $0.01987
   [tailor_resume] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01668 -> ok $0.01620
   [tailor_resume] low_confidence -> ESCALATE_EFFORT (low_confidence: more reasoning should help)
+  [draft_cover_letter] review by mock-large/low: revise score=0.70 ($0.03006)
+  [draft_cover_letter] review_revise -> ESCALATE_EFFORT (review_revise: more reasoning should help)
   [tailor_resume] attempt 2: mock-medium (tier 2, effort medium) p=0.97 est=$0.02199 -> ok $0.01614
   [tailor_resume] review by mock-large/low: accept score=0.96 ($0.02596)
   [tailor_resume] ACCEPTED: mock-medium/medium accepted (review 0.96)
-  [draft_cover_letter] attempt 1: mock-medium (tier 2, effort medium) p=0.97 est=$0.01891 -> ok $0.01987
-  [draft_cover_letter] review by mock-large/low: revise score=0.70 ($0.03006)
-  [draft_cover_letter] review_revise -> ESCALATE_EFFORT (review_revise: more reasoning should help)
   [draft_cover_letter] attempt 2: mock-medium (tier 2, effort high) p=0.97 est=$0.02799 -> ok $0.02965
   [draft_cover_letter] review by mock-large/low: accept score=0.81 ($0.02526)
   [draft_cover_letter] ACCEPTED: mock-medium/high accepted (review 0.81)
@@ -100,16 +100,16 @@ Objective 1: Prepare application package for a synthetic posting  [done]   (ALL 
 
 Model calls:
     # step               purpose  att model        T effort status        in   out       est      cost     ms
-    1 classify_role      task       1 mock-small   3 none   malformed    243    58  $0.00021  $0.00013    316
-    2 classify_role      task       2 mock-small   3 none   ok           278   132  $0.00022  $0.00023    464
-    3 classify_role      task       3 mock-medium  2 none   ok           264   107  $0.00259  $0.00240   1142
-    4 research_company   task       1 mock-medium  2 low    timeout      202     0  $0.01186  $0.00061  60000
-    5 research_company   task       2 mock-medium  2 low    ok           202   820  $0.01186  $0.01291   5420
-    6 tailor_resume      task       1 mock-medium  2 low    ok           310  1018  $0.01668  $0.01620   6608
-    7 tailor_resume      task       2 mock-medium  2 medium ok           329  1010  $0.02199  $0.01614   6560
-    8 tailor_resume      review     2 mock-large   1 low    ok            96   327  $0.02957  $0.02596   4824
-    9 draft_cover_letter task       1 mock-medium  2 medium ok           302  1264  $0.01891  $0.01987   8084
-   10 draft_cover_letter review     1 mock-large   1 low    ok            74   386  $0.02924  $0.03006   5532
+    1 research_company   task       1 mock-medium  2 low    timeout      202     0  $0.01186  $0.00061  60000
+    2 research_company   task       2 mock-medium  2 low    ok           202   820  $0.01186  $0.01291   5420
+    3 classify_role      task       1 mock-small   3 none   malformed    243    58  $0.00021  $0.00013    316
+    4 classify_role      task       2 mock-small   3 none   ok           278   132  $0.00022  $0.00023    464
+    5 classify_role      task       3 mock-medium  2 none   ok           264   107  $0.00259  $0.00240   1142
+    6 draft_cover_letter task       1 mock-medium  2 medium ok           302  1264  $0.01891  $0.01987   8084
+    7 tailor_resume      task       1 mock-medium  2 low    ok           310  1018  $0.01668  $0.01620   6608
+    8 draft_cover_letter review     1 mock-large   1 low    ok            74   386  $0.02924  $0.03006   5532
+    9 tailor_resume      task       2 mock-medium  2 medium ok           329  1010  $0.02199  $0.01614   6560
+   10 tailor_resume      review     2 mock-large   1 low    ok            96   327  $0.02957  $0.02596   4824
    11 draft_cover_letter task       2 mock-medium  2 high   ok           329  1911  $0.02799  $0.02965  11966
    12 draft_cover_letter review     2 mock-large   1 low    ok            74   322  $0.02924  $0.02526   4764
    13 strategic_review   task       1 mock-large   1 high   ok           301  1209  $0.09452  $0.09519  15408
@@ -127,7 +127,7 @@ Tasks:
 Totals (simulated USD):
   total $0.27461 = tasks $0.19332 + reviews $0.08128 + planning $0.00000
   estimated before calls $0.29484; worst case reserved $0.42478; budget $1.00000
-  overshoot beyond reservations $0.00000 (0 call(s))
+  overshoot beyond reservations $0.00000 (0 call(s)); late replies 0 (reconciliation +0.00000)
   spent on failed/rejected attempts $0.06710
   calls 13 (abandoned 0), cache hits 0, retries 2, escalations 3, deterministic steps 2
   downgrades 0, budget requeues 0, recovered tasks 0
@@ -143,17 +143,17 @@ Scenario 'budget' (all model calls simulated)
 
 Objective 1: 'Prepare application package for a synthetic posting' (exact playbook match for kind 'demo_application_package')
   plan v1 (playbook:demo_application_package): 7 steps in 5 waves; parallelizable groups: [['extract_keywords', 'research_company'], ['draft_cover_letter', 'tailor_resume']]
+  [extract_keywords] ACCEPTED: deterministic extract_keywords: $0
   [research_company] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01186 -> ok $0.00919
   [research_company] ACCEPTED: mock-medium/low accepted
-  [extract_keywords] ACCEPTED: deterministic extract_keywords: $0
   [classify_role] attempt 1: mock-small (tier 3, effort none) p=0.97 est=$0.00021 -> ok $0.00021
   [classify_role] ACCEPTED: mock-small/none accepted
-  [draft_cover_letter] attempt 1: mock-medium (tier 2, effort medium) p=0.97 est=$0.01891 -> ok $0.01693
-  [draft_cover_letter] review by mock-large/low: accept score=0.83 ($0.02159)
-  [draft_cover_letter] ACCEPTED: mock-medium/medium accepted (review 0.83)
   [tailor_resume] attempt 1: mock-medium (tier 2, effort low) p=0.97 est=$0.01668 -> ok $0.01356
   [tailor_resume] review by mock-large/low: accept score=0.91 ($0.02379)
   [tailor_resume] ACCEPTED: mock-medium/low accepted (review 0.91)
+  [draft_cover_letter] attempt 1: mock-medium (tier 2, effort medium) p=0.97 est=$0.01891 -> ok $0.01693
+  [draft_cover_letter] review by mock-large/low: accept score=0.83 ($0.02159)
+  [draft_cover_letter] ACCEPTED: mock-medium/medium accepted (review 0.83)
   [assemble] ACCEPTED: deterministic assemble_package: $0
   [strategic_review] WAITING FOR YOU (budget_increase, request 1): Meeting the critical quality floor (0.92) needs ~$0.1400; only $0.0647 is available (critical priority: never downgraded automatically). Approve a budget increase.
 Objective is waiting for your decision (see approvals).
@@ -168,10 +168,10 @@ Model calls:
     # step               purpose  att model        T effort status        in   out       est      cost     ms
     1 research_company   task       1 mock-medium  2 low    ok           202   572  $0.01186  $0.00919   3932
     2 classify_role      task       1 mock-small   3 none   ok           243   122  $0.00021  $0.00021    444
-    3 draft_cover_letter task       1 mock-medium  2 medium ok           302  1068  $0.01891  $0.01693   6908
-    4 draft_cover_letter review     1 mock-large   1 low    ok            74   273  $0.02924  $0.02159   4176
-    5 tailor_resume      task       1 mock-medium  2 low    ok           310   842  $0.01668  $0.01356   5552
-    6 tailor_resume      review     1 mock-large   1 low    ok            96   298  $0.02957  $0.02379   4476
+    3 tailor_resume      task       1 mock-medium  2 low    ok           310   842  $0.01668  $0.01356   5552
+    4 tailor_resume      review     1 mock-large   1 low    ok            96   298  $0.02957  $0.02379   4476
+    5 draft_cover_letter task       1 mock-medium  2 medium ok           302  1068  $0.01891  $0.01693   6908
+    6 draft_cover_letter review     1 mock-large   1 low    ok            74   273  $0.02924  $0.02159   4176
     7 strategic_review   task       1 mock-large   1 high   ok           301  1092  $0.09452  $0.08642  14004
 
 Tasks:
@@ -187,7 +187,7 @@ Tasks:
 Totals (simulated USD):
   total $0.17168 = tasks $0.12630 + reviews $0.04537 + planning $0.00000
   estimated before calls $0.20097; worst case reserved $0.29773; budget $0.31000
-  overshoot beyond reservations $0.00000 (0 call(s))
+  overshoot beyond reservations $0.00000 (0 call(s)); late replies 0 (reconciliation +0.00000)
   spent on failed/rejected attempts $0.00000
   calls 7 (abandoned 0), cache hits 0, retries 0, escalations 0, deterministic steps 2
   downgrades 0, budget requeues 0, recovered tasks 0
@@ -214,10 +214,11 @@ Objective 1: 'Prepare application package for a synthetic posting' (exact playbo
   recovered task 4 (tailor_resume) interrupted at attempt 1
   recovered task 5 (draft_cover_letter) interrupted at attempt 1
   [tailor_resume] attempt 1: resuming from checkpoint (call 3, no new model call)
-  [draft_cover_letter] attempt 1: mock-medium (tier 2, effort medium) p=0.97 est=$0.01891 -> ok $0.01693
   [tailor_resume] review by mock-large/low: accept score=0.91 ($0.02379)
-  [draft_cover_letter] review by mock-large/low: accept score=0.83 ($0.02159)
   [tailor_resume] ACCEPTED: mock-medium/low accepted (review 0.91)
+  [draft_cover_letter] attempt 1: resuming planned route mock-medium/medium
+  [draft_cover_letter] attempt 1: mock-medium (tier 2, effort medium) p=0.97 est=$0.01891 -> ok $0.01693
+  [draft_cover_letter] review by mock-large/low: accept score=0.83 ($0.02159)
   [draft_cover_letter] ACCEPTED: mock-medium/medium accepted (review 0.83)
   [assemble] ACCEPTED: deterministic assemble_package: $0
   [strategic_review] attempt 1: mock-large (tier 1, effort high) p=0.97 est=$0.09452 -> ok $0.08642
@@ -231,8 +232,8 @@ Model calls:
     1 classify_role      task       1 mock-small   3 none   ok           243   122  $0.00021  $0.00021    444
     2 research_company   task       1 mock-medium  2 low    ok           202   572  $0.01186  $0.00919   3932
     3 tailor_resume      task       1 mock-medium  2 low    ok           310   842  $0.01668  $0.01356   5552
-    4 draft_cover_letter task       1 mock-medium  2 medium ok           302  1068  $0.01891  $0.01693   6908
-    5 tailor_resume      review     1 mock-large   1 low    ok            96   298  $0.02957  $0.02379   4476
+    4 tailor_resume      review     1 mock-large   1 low    ok            96   298  $0.02957  $0.02379   4476
+    5 draft_cover_letter task       1 mock-medium  2 medium ok           302  1068  $0.01891  $0.01693   6908
     6 draft_cover_letter review     1 mock-large   1 low    ok            74   273  $0.02924  $0.02159   4176
     7 strategic_review   task       1 mock-large   1 high   ok           301  1092  $0.09452  $0.08642  14004
 
@@ -249,7 +250,7 @@ Tasks:
 Totals (simulated USD):
   total $0.17168 = tasks $0.12630 + reviews $0.04537 + planning $0.00000
   estimated before calls $0.20097; worst case reserved $0.29773; budget $1.00000
-  overshoot beyond reservations $0.00000 (0 call(s))
+  overshoot beyond reservations $0.00000 (0 call(s)); late replies 0 (reconciliation +0.00000)
   spent on failed/rejected attempts $0.00000
   calls 7 (abandoned 0), cache hits 0, retries 0, escalations 0, deterministic steps 2
   downgrades 0, budget requeues 0, recovered tasks 2
@@ -289,7 +290,7 @@ Tasks:
 Totals (simulated USD):
   total $0.07738 = tasks $0.00044 + reviews $0.00000 + planning $0.07694
   estimated before calls $0.07736; worst case reserved $0.11524; budget $1.00000
-  overshoot beyond reservations $0.00000 (0 call(s))
+  overshoot beyond reservations $0.00000 (0 call(s)); late replies 0 (reconciliation +0.00000)
   spent on failed/rejected attempts $0.00000
   calls 2 (abandoned 0), cache hits 0, retries 0, escalations 0, deterministic steps 2
   downgrades 0, budget requeues 0, recovered tasks 0

@@ -43,6 +43,9 @@ OPERATIONAL_TABLES = frozenset(
         "approvals",
         "approval_requests",
         "budget_reservations",
+        "late_replies",
+        "task_results_duplicates",
+        "reviews_duplicates",
     }
 )
 

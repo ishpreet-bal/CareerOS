@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -76,7 +77,7 @@ class Database:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 30000")
         if str(p) != ":memory:":
-            conn.execute("PRAGMA journal_mode = WAL")
+            _set_wal(conn)
             conn.execute("PRAGMA synchronous = NORMAL")
         db = cls(conn, None if str(p) == ":memory:" else p)
         try:
@@ -121,7 +122,7 @@ class Database:
 
     # ------------------------------------------------------------------ migrations
     def _ensure_migrations_table(self) -> None:
-        self.conn.execute(
+        self.conn.execute(  # IF NOT EXISTS: idempotent across concurrent openers
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
             " version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"
         )
@@ -131,25 +132,34 @@ class Database:
         return {r[0] for r in self.conn.execute("SELECT version FROM schema_migrations")}
 
     def migrate(self) -> list[int]:
-        """Apply pending migrations, each atomically. Returns the versions applied."""
-        applied = self.applied_versions()
+        """Apply pending migrations. Returns the versions this call applied.
+
+        Safe when several processes open the same fresh database at once (audit L4): each
+        migration runs statement by statement inside one ``BEGIN IMMEDIATE`` transaction
+        that first re-checks whether another connection already applied it.
+        """
+        self._ensure_migrations_table()
         newly: list[int] = []
         for mig in load_migrations():
-            if mig.version in applied:
+            if mig.version in self.applied_versions():
                 continue
-            script = (
-                "BEGIN;\n"
-                + mig.sql
-                + "\nINSERT INTO schema_migrations(version, name, applied_at) VALUES ("
-                + f"{mig.version}, '{mig.name}', '{utc_now_iso()}');\nCOMMIT;"
-            )
+            self.conn.execute("BEGIN IMMEDIATE")
             try:
-                self.conn.executescript(script)
+                done = self.conn.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version=?", (mig.version,)
+                ).fetchone()
+                if done is None:
+                    for stmt in split_sql(mig.sql):
+                        self.conn.execute(stmt)
+                    self.conn.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?,?,?)",
+                        (mig.version, mig.name, utc_now_iso()),
+                    )
+                    newly.append(mig.version)
+                self.conn.execute("COMMIT")
             except sqlite3.Error as exc:
-                if self.conn.in_transaction:
-                    self.conn.execute("ROLLBACK")
+                self.conn.execute("ROLLBACK")
                 raise MigrationError(f"Migration {mig.version}_{mig.name} failed: {exc}") from exc
-            newly.append(mig.version)
         return newly
 
     def schema_version(self) -> int:
@@ -169,12 +179,12 @@ class Database:
         )
 
     def _bind_dataset_kind(self, kind: DatasetKind) -> None:
-        existing = self.get_meta("dataset_kind")
-        if existing is None:
-            with self.transaction():
+        with self.transaction():  # read-then-bind under the write lock (audit L4)
+            existing = self.get_meta("dataset_kind")
+            if existing is None:
                 self.set_meta("dataset_kind", kind)
                 self.set_meta("created_at", utc_now_iso())
-        elif existing != kind:
+        if existing is not None and existing != kind:
             raise DatasetKindMismatchError(
                 f"Database holds {existing!r} data but {kind!r} was requested. "
                 "Synthetic and personal data must use separate databases."
@@ -193,6 +203,41 @@ class Database:
 
 
 # ---------------------------------------------------------------------- JSON helpers
+def _set_wal(conn: sqlite3.Connection, attempts: int = 100) -> None:
+    """Switch to WAL. On a brand-new file several openers can race for the exclusive lock
+    this needs, and SQLite reports SQLITE_BUSY without consulting the busy timeout, so the
+    switch is retried with bounded backoff (audit L4)."""
+    for i in range(attempts):
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+            if i == attempts - 1:
+                raise
+            time.sleep(min(0.1, 0.005 * (i + 1)))
+
+
+def split_sql(script: str) -> list[str]:
+    """Split a migration script into complete statements (comments are dropped)."""
+    out: list[str] = []
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        if not buf and line.strip().startswith("--"):
+            continue
+        buf += line
+        if sqlite3.complete_statement(buf):
+            if buf.strip().strip(";").strip():
+                out.append(buf.strip())
+            buf = ""
+    if buf.strip() and not all(
+        ln.strip().startswith("--") or not ln.strip() for ln in buf.splitlines()
+    ):
+        raise MigrationError(f"Incomplete SQL statement at end of migration: {buf[:80]!r}")
+    return out
+
+
 def to_json(value: Any) -> str:
     """Serialize to compact, deterministic JSON for storage."""
     return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
