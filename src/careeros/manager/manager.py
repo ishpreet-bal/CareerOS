@@ -114,9 +114,14 @@ class ObjectiveRequest:
 class RunSummary:
     objective_id: int
     status: ObjectiveStatus
+    #: Genuine execution attempts started in this invocation: distinct (task, attempt)
+    #: pairs claimed. Re-claiming an attempt already counted (after a contention requeue,
+    #: say) is a dispatch, not a new attempt (audit L5).
     attempts_executed: int
     events: list[str]
     stop_reason: str | None = None
+    #: Every successful claim, including re-claims of an attempt already counted.
+    dispatches: int = 0
 
 
 class CareerManager:
@@ -482,6 +487,11 @@ class CareerManager:
         """Advance an objective until done, blocked on the user, or ``max_attempts`` task
         attempts have started in this invocation. Safe to call repeatedly (resume).
 
+        ``max_attempts`` limits genuine execution attempts - distinct (task, attempt)
+        pairs - not dispatcher activity: a task requeued for budget contention and claimed
+        again resumes the same attempt and is not counted twice (audit L5). A resumed
+        attempt (after recovery) counts once in the invocation that resumes it.
+
         Independent ready tasks run concurrently, at most ``execution.max_concurrency`` at a
         time. ``force_recover`` treats every other session as dead (use only when you know
         no other CareerOS process is running, e.g. after a container restart).
@@ -517,7 +527,8 @@ class CareerManager:
 
         running: dict[Future[str], Fence] = {}
         deferred: set[int] = set()  # waiting for a concurrent reservation to settle
-        started = 0
+        counted: set[tuple[int, int]] = set()  # (task, attempt) started in this run
+        dispatches = 0
         idle_contention = 0
         stop_reason: str | None = None
         crash: SessionTerminatedError | None = None
@@ -532,21 +543,26 @@ class CareerManager:
                 obj = self.repo.get_objective(objective_id)
                 active = obj.status is ObjectiveStatus.ACTIVE and crash is None and not halted
                 done_now = active and self._done(obj)
-                quota_left = max_attempts is None or started < max_attempts
-                if active and not done_now and quota_left:
+                quota_left = max_attempts is None or len(counted) < max_attempts
+                if active and not done_now:
                     for task in self._ready_tasks(objective_id):
-                        if len(running) >= limit or not (
-                            max_attempts is None or started < max_attempts
-                        ):
+                        if len(running) >= limit:
                             break
                         assert task.id is not None
-                        if task.id in deferred and running:
+                        if task.id in deferred:
+                            # Requeued for budget contention: wait until another task
+                            # settles or the bounded back-off below elapses, instead of
+                            # re-claiming it at once in a hot loop (finding N6).
+                            continue
+                        if not self._within_quota(task, counted, max_attempts):
                             continue
                         fence = self._claim(task, session)
                         if fence is not None:
-                            started += 1
+                            dispatches += 1
+                            counted.add((fence.task_id, fence.attempt))
                             deferred.discard(task.id)
                             running[pool.submit(work, fence)] = fence
+                quota_left = max_attempts is None or len(counted) < max_attempts
                 if not running:
                     if crash is not None:
                         break
@@ -561,9 +577,8 @@ class CareerManager:
                             obj, ObjectiveStatus.DONE, "definition of done met"
                         )
                         break
-                    if not quota_left:
-                        stop_reason = "attempt limit for this invocation"
-                        break
+                    # Deferred tasks resume an attempt already counted, so they are
+                    # waited for (bounded) before the quota can end the run (audit L5).
                     if deferred:  # budget held by another session's reservation
                         idle_contention += 1
                         if idle_contention > 50:
@@ -572,6 +587,9 @@ class CareerManager:
                         deferred.clear()
                         time.sleep(0.05)
                         continue
+                    if not quota_left:
+                        stop_reason = "attempt limit for this invocation"
+                        break
                     stop_reason = self._settle_idle(obj, session)
                     break
                 finished, _ = wait(running, return_when=FIRST_COMPLETED, timeout=0.5)
@@ -610,7 +628,14 @@ class CareerManager:
         # its remaining tasks immediately instead of waiting for their leases to expire.
         self.repo.end_session(session, stop_reason or "stopped")
         final = self.repo.get_objective(objective_id)
-        return RunSummary(objective_id, final.status, started, self.events[start:], stop_reason)
+        return RunSummary(
+            objective_id,
+            final.status,
+            len(counted),
+            self.events[start:],
+            stop_reason,
+            dispatches,
+        )
 
     # ---------------------------------------------------------------- ownership
     def _now(self) -> str:
@@ -631,6 +656,26 @@ class CareerManager:
         lease = _iso(self.clock() + timedelta(seconds=self.config.limits.lease_seconds))
         with self.db.transaction() as c:
             return claim(c, task.id, session, lease, self._now())
+
+    def _within_quota(
+        self, task: Task, counted: set[tuple[int, int]], max_attempts: int | None
+    ) -> bool:
+        """May ``task`` be dispatched under the per-invocation attempt quota (audit L5)?
+
+        The claim resumes an open attempt or starts the next one (``fencing.claim``), so
+        the attempt it would run is ``attempt + (1 - attempt_open)``. Re-claiming an
+        attempt this invocation already counted (e.g. after a budget-contention requeue)
+        is the same attempt and always allowed; anything else needs quota left. The
+        quota is a per-invocation limit, not a safety property: if the row changes
+        between this read and the claim, at most one extra attempt starts."""
+        if max_attempts is None:
+            return True
+        if len(counted) < max_attempts:
+            return True
+        r = self.db.query_one(
+            "SELECT attempt + (1 - attempt_open) AS next FROM tasks WHERE id=?", (task.id,)
+        )
+        return r is not None and (task.id, int(r["next"])) in counted
 
     def _heartbeat(
         self, session: str, stop: threading.Event, kind: DatasetKind, state: LeaseState

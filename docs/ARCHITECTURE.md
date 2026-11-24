@@ -1298,3 +1298,34 @@ a task today) can be decided only while its task is `blocked_budget` or `awaitin
 Not changed in C1 (scheduled): plan installation is not atomic and task rows are not
 versioned by plan, so "task belongs to the current plan" is not yet a claim condition — that
 is part of C5 (finding N5).
+
+### 19.2 C2 — attempt counting (L5, N6)
+
+Two counters, kept distinct:
+
+* **Per-task attempt** (`tasks.attempt`, `attempt_open`; checked against the task's
+  `max_attempts` retry limit). Unchanged: a claim resumes an open attempt and only starts a
+  new one after the previous attempt was closed by an outcome. Budget-contention requeues,
+  halts, lost ownership, blocked-before-answer and recovery keep the attempt open, so the
+  number (and the idempotency keys built from it) is stable; the ownership generation
+  advances on every claim. Regression tests now pin this (a task allowed one attempt gets
+  it after five contention requeues, after a crash and after a takeover).
+* **Per-invocation quota** (`run(max_attempts=...)`, `RunSummary.attempts_executed`). Now
+  counts distinct `(task, attempt)` pairs claimed in the invocation. Re-claiming an attempt
+  already counted is a dispatch (`RunSummary.dispatches`), not an attempt. The quota check
+  uses the attempt the claim would actually run (`attempt + (1 - attempt_open)`), so a
+  genuine retry still needs quota. The quota is a per-invocation limit, not a safety
+  property: a row changing between that read and the claim can start at most one extra
+  attempt.
+
+Before: every successful claim counted, so with `max_attempts=1` one contention requeue
+ended the run ("attempt limit for this invocation") before the task had executed, and one
+execution after two requeues was reported as three attempts.
+
+**N6 (found during C2, fixed).** A task requeued for contention was re-claimed in the same
+dispatch pass whenever nothing else was running, so a lone task contending with another
+session's reservation looped claim → requeue at ~770 cycles/s (each writing a decision and
+a generation) and the run never returned; the intended back-off never ran. Deferred tasks
+are now always skipped for the rest of the pass, and the existing bounded back-off (50 ×
+50 ms) runs before the quota check: the run stops with "budget is reserved by another
+active session" (resumable, attempt still open, no approval request).

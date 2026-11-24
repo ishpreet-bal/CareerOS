@@ -9,7 +9,8 @@ fails on the baseline passes after the change, and CI is green on the fixing com
 | N1 | Approve/deny validated outside their write transaction: concurrent decisions on one request both applied | C1 | **Fixed** in `523c227` |
 | N2 | `end_session` overwrote a "presumed dead" end reason | C1 | **Fixed** in `523c227` |
 | L10 | Claim did not re-check prerequisites or objective status | C1 | **Fixed** in `523c227`; plan membership is part of C5 (N5) |
-| L5 | Requeued claims count toward per-run `max_attempts` | C2 | Open |
+| L5 | Requeued claims count toward per-run `max_attempts` | C2 | **Fixed** in C2 (evidence below) |
+| N6 | Hot, unbounded claim/requeue loop for a lone task under budget contention (found during C2) | C2 | **Fixed** in C2 |
 | L7 | Ctrl-C does not stop workers; no SIGTERM handling | C3 | Open |
 | L8 | `synchronous=NORMAL` | C4 | Open |
 | L9 | Planning has no heartbeat, ownership or resume (reproduced) | C5 | Open |
@@ -37,6 +38,23 @@ Verification on `523c227`: full suite 549 passed (three local runs and CI run #8
 `ruff check`, `ruff format --check`, `mypy` (strict, `src`) clean; coverage 96% (fencing
 100%, repositories 96%, manager 94%); concurrency, ownership, separate-process, migration
 and C1 suites (91 tests) 5/5 runs.
+
+## C2 evidence
+
+Regression tests in `tests/test_hardening_c2.py`. Against the baseline source (`488a283`,
+same code as `523c227`) 5 fail and 4 pass; all 9 pass after C2.
+
+| Finding | Test | Baseline behaviour observed |
+|---|---|---|
+| L5 | `test_contention_requeues_do_not_use_up_the_run_quota` | With `max_attempts=1`, one contention requeue ended the run with "attempt limit for this invocation"; the task never executed |
+| L5 | `test_reported_attempts_exclude_requeued_dispatches` | One execution after two requeues reported as `attempts_executed == 3` |
+| L5 | `test_the_quota_still_limits_genuine_attempts` | Behaviour preserved; fails on the baseline only because `RunSummary.dispatches` does not exist there |
+| N6 | `test_permanent_contention_backs_off_and_stops[None]`, `[1]` | Run never returned: 10,350 and 7,748 requeues (and as many generations) in 20 s; reproduced standalone at ~770 cycles/s |
+| guards | `test_genuine_retries_count_against_the_quota`, `test_contention_does_not_consume_the_task_retry_limit`, `test_recovery_resumes_the_attempt_and_counts_it_once_per_run`, `test_lost_ownership_does_not_advance_the_attempt` | Pass on both: the per-task attempt counter was already correct; these pin it |
+
+Verification: full suite 558 passed; `ruff check`, `ruff format --check`, `mypy` clean;
+coverage 96% (manager 95%); concurrency, ownership, separate-process, manager, C1 and C2
+suites (110 tests) 5/5 runs.
 
 ## N5 — requirements carried into C5
 
