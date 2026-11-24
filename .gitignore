@@ -28,5 +28,6 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
 var/
