@@ -50,11 +50,18 @@ same code as `523c227`) 5 fail and 4 pass; all 9 pass after C2.
 | L5 | `test_reported_attempts_exclude_requeued_dispatches` | One execution after two requeues reported as `attempts_executed == 3` |
 | L5 | `test_the_quota_still_limits_genuine_attempts` | Behaviour preserved; fails on the baseline only because `RunSummary.dispatches` does not exist there |
 | N6 | `test_permanent_contention_backs_off_and_stops[None]`, `[1]` | Run never returned: 10,350 and 7,748 requeues (and as many generations) in 20 s; reproduced standalone at ~770 cycles/s |
+| L5 (race, follow-up) | `test_quota_cannot_be_exceeded_when_another_process_closes_the_attempt` (separate processes) | On `760351b`: invocation A (quota 1) decided its re-claim was the counted attempt 1; process B then resumed and closed attempt 1; A's claim started attempt 2 and executed it (`attempts_executed == 2`) |
+| L5 (race, follow-up) | `test_claim_restricted_to_an_attempt_resumes_it_but_never_starts_another` | Fails on `760351b` only because `claim(..., only_attempt=)` does not exist there |
 | guards | `test_genuine_retries_count_against_the_quota`, `test_contention_does_not_consume_the_task_retry_limit`, `test_recovery_resumes_the_attempt_and_counts_it_once_per_run`, `test_lost_ownership_does_not_advance_the_attempt` | Pass on both: the per-task attempt counter was already correct; these pin it |
 
-Verification: full suite 558 passed; `ruff check`, `ruff format --check`, `mypy` clean;
-coverage 96% (manager 95%); concurrency, ownership, separate-process, manager, C1 and C2
-suites (110 tests) 5/5 runs.
+Verification (`760351b`): full suite 558 passed; `ruff check`, `ruff format --check`,
+`mypy` clean; coverage 96% (manager 95%); concurrency-related suites (110 tests) 5/5 runs;
+CI run #10 green.
+
+Follow-up (quota race): the quota restriction moved into the claiming statement
+(`only_attempt`). Full suite 560 passed; lint, format, types clean; coverage 96% (fencing
+100%, manager 95%); the separate-process race test 10/10; concurrency-related suites
+(123 tests) 5/5 runs.
 
 ## N5 — requirements carried into C5
 

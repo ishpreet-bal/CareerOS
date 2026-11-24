@@ -1312,11 +1312,15 @@ Two counters, kept distinct:
   it after five contention requeues, after a crash and after a takeover).
 * **Per-invocation quota** (`run(max_attempts=...)`, `RunSummary.attempts_executed`). Now
   counts distinct `(task, attempt)` pairs claimed in the invocation. Re-claiming an attempt
-  already counted is a dispatch (`RunSummary.dispatches`), not an attempt. The quota check
-  uses the attempt the claim would actually run (`attempt + (1 - attempt_open)`), so a
-  genuine retry still needs quota. The quota is a per-invocation limit, not a safety
-  property: a row changing between that read and the claim can start at most one extra
-  attempt.
+  already counted is a dispatch (`RunSummary.dispatches`), not an attempt. With quota left
+  a claim may start or resume any attempt (it adds at most one, and an invocation's
+  dispatcher claims one task at a time). With no quota left the claim is restricted, **in
+  the claiming statement itself**, to resuming an attempt this invocation already counted
+  (`fencing.claim(..., only_attempt=n)` adds `attempt + (1 - attempt_open) = n` to the
+  claim's `WHERE`). The quota therefore holds for the attempt actually claimed: another
+  process closing or advancing the attempt between the dispatcher's decision and the claim
+  makes the claim fail instead of starting a new attempt. A genuine retry still needs
+  quota. No schema change.
 
 Before: every successful claim counted, so with `max_attempts=1` one contention requeue
 ended the run ("attempt limit for this invocation") before the task had executed, and one

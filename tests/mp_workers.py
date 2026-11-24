@@ -272,3 +272,72 @@ def decide_request(data_dir: str, request_id: int, action: str, barrier: Any, ou
                 _report(out, action=action, result="refused", reason=str(exc))
     except BaseException:
         _report(out, error=traceback.format_exc())
+
+
+def quota_race_owner(
+    data_dir: str,
+    objective_id: int,
+    book: dict[str, Any],
+    held_reservation: int,
+    paused: Any,
+    proceed: Any,
+    out: Any,
+) -> None:
+    """Invocation A, quota 1. Its first claim of attempt 1 is requeued for budget
+    contention (another session's reservation, released right after). Its next claim -
+    of the same, already counted attempt - is paused between the quota decision and the
+    claim itself, while another process changes the task."""
+    try:
+        from careeros.cost.budget import BudgetManager
+        from careeros.manager.manager import CareerManager
+
+        orig_requeue, orig_claim = CareerManager._requeue, CareerManager._claim
+        claims: list[int] = []
+
+        def requeue(self: Any, fence: Any, task: Any, reason: str) -> None:
+            orig_requeue(self, fence, task, reason)
+            with self.db.transaction() as c:
+                BudgetManager.release_in(c, held_reservation)
+
+        def claim(self: Any, *args: Any, **kwargs: Any) -> Any:
+            claims.append(1)
+            if len(claims) == 2:  # quota already decided for this claim
+                paused.set()
+                proceed.wait(60)
+            return orig_claim(self, *args, **kwargs)
+
+        CareerManager._requeue = requeue  # type: ignore[method-assign]
+        CareerManager._claim = claim  # type: ignore[method-assign]
+        with _ctx(data_dir) as c:
+            s = _manager(c, book).run(objective_id, max_attempts=1)
+            t = c.db.query_one("SELECT attempt FROM tasks WHERE objective_id=?", (objective_id,))
+            _report(
+                out,
+                attempts_executed=s.attempts_executed,
+                dispatches=getattr(s, "dispatches", None),
+                stop_reason=s.stop_reason,
+                task_attempt=t["attempt"],
+            )
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def run_scripted(
+    data_dir: str,
+    objective_id: int,
+    book: dict[str, Any],
+    script: dict[str, list[str]],
+    max_attempts: int | None,
+    out: Any,
+) -> None:
+    """Run an objective with a scripted adapter (e.g. to make an attempt time out)."""
+    try:
+        from careeros.llm.adapters.scripted import ScriptedAdapter
+
+        with _ctx(data_dir) as c:
+            s = _manager(c, book, adapter=ScriptedAdapter(script)).run(
+                objective_id, max_attempts=max_attempts
+            )
+            _report(out, status=s.status.value, stop_reason=s.stop_reason)
+    except BaseException:
+        _report(out, error=traceback.format_exc())

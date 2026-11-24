@@ -246,3 +246,92 @@ def test_permanent_contention_backs_off_and_stops(ctx: AppContext, quota: int | 
     t = task_by_step(ctx, oid, "m")
     assert (t["status"], t["attempt"], t["attempt_open"]) == ("ready", 1, 1)
     assert ctx.db.query("SELECT * FROM approval_requests") == []  # waits, never blocks
+
+
+# ============================ quota race across separate processes (C2 follow-up)
+def test_quota_cannot_be_exceeded_when_another_process_closes_the_attempt(
+    ctx: AppContext,
+) -> None:
+    """Invocation A (quota 1) has counted attempt 1, which was requeued. A decides the
+    re-claim is the same attempt; before it claims, process B resumes attempt 1 and
+    closes it (timeout -> retry scheduled). A's claim must not then start attempt 2: the
+    quota has to hold for the attempt actually claimed, decided atomically with it."""
+    import multiprocessing as mp
+
+    from tests import mp_workers
+
+    pb = {"name": "c2", "plan": {"steps": [model_step("m")]}}
+    m = CareerManager(ctx, playbooks=PlaybookLibrary([book("c2", [model_step("m")])]))
+    oid = _submit(m)
+    bm = BudgetManager(ctx.db, ctx.config)
+    bm.lines_for(oid, None, None)
+    line = ctx.db.query_one(
+        "SELECT id, limit_usd FROM budgets WHERE scope='objective' AND scope_ref=?", (str(oid),)
+    )
+    assert line is not None
+    held = bm.reserve([int(line["id"])], float(line["limit_usd"]) - 0.001, session_id=None)
+
+    spawn = mp.get_context("spawn")
+    paused, proceed, q = spawn.Event(), spawn.Event(), spawn.Queue()
+    a = spawn.Process(
+        target=mp_workers.quota_race_owner,
+        args=(str(ctx.data_dir), oid, pb, held.id, paused, proceed, q),
+    )
+    a.start()
+    assert paused.wait(60), "invocation A never reached its second claim"
+    t = task_by_step(ctx, oid, "m")
+    assert (t["status"], t["attempt"], t["attempt_open"]) == ("ready", 1, 1)
+    b = spawn.Process(
+        target=mp_workers.run_scripted,
+        args=(str(ctx.data_dir), oid, pb, {"m:research.company": ["timeout"]}, 1, q),
+    )
+    b.start()
+    rb = q.get(timeout=60)
+    b.join(60)
+    assert "error" not in rb, rb
+    t = task_by_step(ctx, oid, "m")
+    assert (t["status"], t["attempt"], t["attempt_open"]) == ("retry_scheduled", 1, 0)
+    proceed.set()
+    ra = q.get(timeout=60)
+    a.join(60)
+    assert "error" not in ra, ra.get("error")
+    # A executed attempt 1 only; attempt 2 is left for a later invocation.
+    assert ra["attempts_executed"] == 1, ra
+    assert ra["stop_reason"] == "attempt limit for this invocation", ra
+    assert ra["task_attempt"] == 1, ra
+    t = task_by_step(ctx, oid, "m")
+    assert (t["status"], t["attempt"]) == ("retry_scheduled", 1)
+
+
+def test_claim_restricted_to_an_attempt_resumes_it_but_never_starts_another(
+    ctx: AppContext,
+) -> None:
+    from careeros.orchestration.fencing import claim
+
+    m = _manager(ctx, [model_step("m")])
+    oid = _submit(m)
+    tid = int(str(task_by_step(ctx, oid, "m")["id"]))
+    sid = m.repo.start_session()
+    far, now = "2099-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"
+
+    def take(only: int | None) -> Any:
+        with ctx.db.transaction() as c:
+            return claim(c, tid, sid, far, now, only_attempt=only)
+
+    def set_row(status: str, attempt: int, open_: int) -> None:
+        with ctx.db.transaction() as c:
+            c.execute(
+                "UPDATE tasks SET status=?, attempt=?, attempt_open=?, lease_owner=NULL WHERE id=?",
+                (status, attempt, open_, tid),
+            )
+
+    set_row("ready", 1, 1)  # attempt 1 open (requeued): resuming it is allowed
+    f = take(1)
+    assert f is not None and f.attempt == 1
+    set_row("retry_scheduled", 1, 0)  # attempt 1 closed: the claim would start attempt 2
+    assert take(1) is None
+    assert task_by_step(ctx, oid, "m")["status"] == "retry_scheduled"  # untouched
+    set_row("ready", 2, 1)  # a different open attempt
+    assert take(1) is None
+    f = take(None)  # unrestricted (quota left): starts or resumes as before
+    assert f is not None and f.attempt == 2

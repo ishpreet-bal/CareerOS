@@ -554,9 +554,10 @@ class CareerManager:
                             # settles or the bounded back-off below elapses, instead of
                             # re-claiming it at once in a hot loop (finding N6).
                             continue
-                        if not self._within_quota(task, counted, max_attempts):
+                        allowed, only_attempt = self._quota_for(task, counted, max_attempts)
+                        if not allowed:
                             continue
-                        fence = self._claim(task, session)
+                        fence = self._claim(task, session, only_attempt=only_attempt)
                         if fence is not None:
                             dispatches += 1
                             counted.add((fence.task_id, fence.attempt))
@@ -649,33 +650,34 @@ class CareerManager:
             check_fence(c, fence, self._now())
             yield c
 
-    def _claim(self, task: Task, session: str) -> Fence | None:
+    def _claim(self, task: Task, session: str, *, only_attempt: int | None = None) -> Fence | None:
         """Atomically take a runnable task and mint its fencing token. Exactly one
-        claimant can succeed, across threads and processes."""
+        claimant can succeed, across threads and processes. ``only_attempt`` restricts
+        the claim to resuming that attempt (see ``fencing.claim``)."""
         assert task.id is not None
         lease = _iso(self.clock() + timedelta(seconds=self.config.limits.lease_seconds))
         with self.db.transaction() as c:
-            return claim(c, task.id, session, lease, self._now())
+            return claim(c, task.id, session, lease, self._now(), only_attempt=only_attempt)
 
-    def _within_quota(
-        self, task: Task, counted: set[tuple[int, int]], max_attempts: int | None
-    ) -> bool:
-        """May ``task`` be dispatched under the per-invocation attempt quota (audit L5)?
+    @staticmethod
+    def _quota_for(
+        task: Task, counted: set[tuple[int, int]], max_attempts: int | None
+    ) -> tuple[bool, int | None]:
+        """(may dispatch, attempt the claim is restricted to) under the per-invocation
+        genuine-attempt quota (audit L5).
 
-        The claim resumes an open attempt or starts the next one (``fencing.claim``), so
-        the attempt it would run is ``attempt + (1 - attempt_open)``. Re-claiming an
-        attempt this invocation already counted (e.g. after a budget-contention requeue)
-        is the same attempt and always allowed; anything else needs quota left. The
-        quota is a per-invocation limit, not a safety property: if the row changes
-        between this read and the claim, at most one extra attempt starts."""
-        if max_attempts is None:
-            return True
-        if len(counted) < max_attempts:
-            return True
-        r = self.db.query_one(
-            "SELECT attempt + (1 - attempt_open) AS next FROM tasks WHERE id=?", (task.id,)
-        )
-        return r is not None and (task.id, int(r["next"])) in counted
+        With quota left, any claim may proceed: it adds at most one attempt, and this
+        invocation's dispatcher claims one task at a time. With no quota left, only an
+        attempt this invocation already counted may be resumed - and that restriction is
+        enforced inside the claiming statement (``only_attempt``), not by an earlier
+        read, so another process closing or advancing the attempt in between cannot make
+        the claim start a new one."""
+        if max_attempts is None or len(counted) < max_attempts:
+            return True, None
+        mine = [a for t, a in counted if t == task.id]
+        if not mine:
+            return False, None
+        return True, max(mine)
 
     def _heartbeat(
         self, session: str, stop: threading.Event, kind: DatasetKind, state: LeaseState

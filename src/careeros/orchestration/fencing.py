@@ -66,19 +66,33 @@ _CLAIM_SQL = (
     "UPDATE tasks SET status='running', owner_generation=owner_generation+1,"  # noqa: S608
     " attempt = attempt + (1 - attempt_open), attempt_open = 1,"
     " lease_owner=?, lease_expires_at=?, started_at=COALESCE(started_at, ?), updated_at=?"
-    " WHERE id=? AND " + CLAIMABLE_SQL  # module constants only: no external input
+    " WHERE id=? AND "
+    + CLAIMABLE_SQL  # module constants only: no external input
+    + " AND (? IS NULL OR attempt + (1 - attempt_open) = ?)"
 )
 
 
 def claim(
-    c: sqlite3.Connection, task_id: int, session: str, lease_iso: str, now_iso: str
+    c: sqlite3.Connection,
+    task_id: int,
+    session: str,
+    lease_iso: str,
+    now_iso: str,
+    *,
+    only_attempt: int | None = None,
 ) -> Fence | None:
     """Take a runnable task. Resumes the same attempt if the last one is still open
     (interrupted, requeued or blocked before an answer); otherwise starts the next one.
 
     Returns None unless the task satisfies :data:`CLAIMABLE_SQL` at the moment of the
-    claim, checked in the same statement that takes it."""
-    cur = c.execute(_CLAIM_SQL, (session, lease_iso, now_iso, now_iso, task_id))
+    claim, checked in the same statement that takes it. With ``only_attempt`` the claim
+    also succeeds only if the attempt it would run (``attempt + 1 - attempt_open``) is
+    exactly that one - so a caller with no attempt quota left can resume an attempt it
+    already counted but can never start a new one, even if another process changed the
+    task in the meantime (audit L5)."""
+    cur = c.execute(
+        _CLAIM_SQL, (session, lease_iso, now_iso, now_iso, task_id, only_attempt, only_attempt)
+    )
     if cur.rowcount != 1:
         return None
     r = c.execute("SELECT owner_generation, attempt FROM tasks WHERE id=?", (task_id,)).fetchone()
