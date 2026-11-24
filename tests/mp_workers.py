@@ -341,3 +341,99 @@ def run_scripted(
             _report(out, status=s.status.value, stop_reason=s.stop_reason)
     except BaseException:
         _report(out, error=traceback.format_exc())
+
+
+def _hold_adapter(steps: list[str], entered: Any, release: Any, timeout: float) -> Any:
+    """Calls for ``steps`` block (inside the 'provider') until ``release``; each puts its
+    step on the ``entered`` queue when it starts."""
+    from careeros.llm.adapters.mock import MockAdapter
+
+    class Hold(MockAdapter):
+        mode_label: ClassVar[str] = "mock"
+
+        def call(self, profile: Any, request: Any) -> Any:
+            step = request.simulation.get("step")
+            if step in steps and request.task_type != "quality.review":
+                steps.remove(step)
+                entered.put(step)
+                release.wait(timeout)
+            return super().call(profile, request)
+
+    return Hold()
+
+
+def run_with_signals(
+    data_dir: str,
+    objective_id: int,
+    book: dict[str, Any],
+    steps: list[str],
+    entered: Any,
+    release: Any,
+    out: Any,
+    limits: dict[str, Any] | None = None,
+    requeued: Any = None,
+    timeout: float = 30.0,
+    signalled: Any = None,
+) -> None:
+    """Run an objective the way the CLI does: SIGINT/SIGTERM handled by
+    ``graceful_shutdown``. Reports the run summary (a forced exit reports nothing).
+    ``signalled`` is set once the handler has processed a signal (so a test can send a
+    second one only after the first was handled: pending signals of one kind coalesce)."""
+    try:
+        from careeros.manager.manager import CareerManager
+        from careeros.orchestration.shutdown import graceful_shutdown
+
+        if requeued is not None:
+            orig = CareerManager._requeue
+
+            def requeue(self: Any, fence: Any, task: Any, reason: str) -> None:
+                orig(self, fence, task, reason)
+                requeued.set()
+
+            CareerManager._requeue = requeue  # type: ignore[method-assign]
+        with _ctx(data_dir, limits) as c:
+            m = _manager(c, book, adapter=_hold_adapter(steps, entered, release, timeout))
+
+            def notify(_msg: str) -> None:
+                if signalled is not None:
+                    signalled.set()
+
+            with graceful_shutdown(m, notify=notify):
+                s = m.run(objective_id)
+            _report(out, status=s.status.value, stop_reason=s.stop_reason, dispatches=s.dispatches)
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+def run_like_cli(
+    data_dir: str,
+    objective_id: int,
+    book: dict[str, Any],
+    steps: list[str],
+    entered: Any,
+    release: Any,
+    out: Any,
+) -> None:
+    """Run an objective as the ``resume`` command does - with its shutdown handling if
+    this version has one (``graceful_shutdown``), otherwise Python's default SIGINT
+    behaviour (KeyboardInterrupt). Reports the summary, or the exception's name."""
+    try:
+        from contextlib import AbstractContextManager, nullcontext
+
+        try:
+            from careeros.orchestration.shutdown import graceful_shutdown
+        except ImportError:  # versions before C3
+            graceful_shutdown = None  # type: ignore[assignment]
+
+        with _ctx(data_dir) as c:
+            m = _manager(c, book, adapter=_hold_adapter(steps, entered, release, 30.0))
+            guard: AbstractContextManager[Any] = (
+                graceful_shutdown(m, notify=lambda _msg: None)
+                if graceful_shutdown is not None
+                else nullcontext()
+            )
+            with guard:
+                s = m.run(objective_id)
+            _report(out, stop_reason=s.stop_reason, status=s.status.value)
+    except BaseException as exc:
+        _report(out, raised=type(exc).__name__)

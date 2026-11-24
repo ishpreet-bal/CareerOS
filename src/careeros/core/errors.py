@@ -41,3 +41,13 @@ class SessionTerminatedError(CareerOSError):
     Never caught and converted into a task failure: state is left exactly as a crash
     would leave it, and the next session recovers it.
     """
+
+
+class SessionCancelledError(CareerOSError):
+    """A controlled shutdown was requested (e.g. Ctrl-C / SIGTERM). Workers stop at their
+    next safe point and hand their task back (attempt kept open) through an
+    ownership-checked transition; the run then ends its session normally."""
+
+    #: Set by the worker after its hand-back: True (released), False (no longer the
+    #: owner: finished or taken over), None (the database was unavailable; retry).
+    released: bool | None = True

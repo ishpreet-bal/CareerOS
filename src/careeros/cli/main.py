@@ -14,6 +14,7 @@ from careeros.core.config import AppConfig, load_config
 from careeros.core.errors import CareerOSError
 from careeros.cost.report import build_report, format_report
 from careeros.manager.manager import CareerManager
+from careeros.orchestration.shutdown import graceful_shutdown
 from careeros.simulation import SCENARIOS, run_scenario
 from careeros.storage.location import resolve_data_dir
 from careeros.synthetic import seed_synthetic
@@ -135,7 +136,9 @@ def resume(
     cfg = _load(config_dir)
     try:
         with open_context(cfg) as ctx:
-            summary = CareerManager(ctx).run(objective_id, force_recover=force_recover)
+            manager = CareerManager(ctx)
+            with graceful_shutdown(manager):  # SIGINT/SIGTERM: stop safely; twice: exit
+                summary = manager.run(objective_id, force_recover=force_recover)
             typer.echo("\n".join(summary.events))
             typer.echo(f"Objective {objective_id}: {summary.status.value} ({summary.stop_reason})")
     except CareerOSError as exc:

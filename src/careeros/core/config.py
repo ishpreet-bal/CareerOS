@@ -113,6 +113,10 @@ class LimitsConfig(_Strict):
     #: Immediate retries of a failed lease renewal (with short backoff) before waiting for
     #: the next heartbeat interval.
     heartbeat_retries: int = Field(default=2, ge=0, le=10)
+    #: After a shutdown request, how long workers still inside a provider call may take
+    #: to reach a safe point before their tasks are released (calls abandoned, replies
+    #: recorded as late). The heartbeat keeps their leases alive meanwhile.
+    shutdown_grace_seconds: float = Field(default=30.0, ge=0)
     research: ResearchLimits = ResearchLimits()
 
     def heartbeat_interval(self) -> float:

@@ -36,6 +36,7 @@ from careeros.core.errors import (
     CareerOSError,
     NotFoundError,
     OwnershipLostError,
+    SessionCancelledError,
     SessionHaltedError,
     SessionTerminatedError,
 )
@@ -161,7 +162,25 @@ class CareerManager:
         self._halt = threading.Event()
         #: Set by the heartbeat when leases cannot be renewed safely; workers halt.
         self._lease_lost = threading.Event()
+        #: Set by ``request_cancel`` (controlled shutdown, e.g. Ctrl-C); never cleared by
+        #: ``run``, so a request that arrives between runs is honoured by the next one.
+        self._cancel = threading.Event()
+        self._cancel_reason: list[str] = []
         self._session: str | None = None
+
+    def request_cancel(self, reason: str = "shutdown requested") -> bool:
+        """Ask the running (or next) ``run`` to stop safely. Idempotent; returns True only
+        for the first request. Safe to call from a signal handler or another thread: it
+        only sets an event (no locks besides the event's own, no logging, no I/O), so a
+        signal can never interrupt a transaction half-way."""
+        first = not self._cancel.is_set()
+        if first:
+            self._cancel_reason.append(reason)
+        self._cancel.set()
+        return first
+
+    def _cancel_text(self) -> str:
+        return self._cancel_reason[0] if self._cancel_reason else "shutdown requested"
 
     # ================================================================ logging / halting
     def _log(self, msg: str) -> None:
@@ -175,6 +194,8 @@ class CareerManager:
             raise SessionTerminatedError("execution session halted")
         if self._lease_lost.is_set():
             raise SessionHaltedError("leases could not be renewed; worker stopped safely")
+        if self._cancel.is_set():
+            raise SessionCancelledError(self._cancel_text())
 
     def _clone(self) -> CareerManager:
         """A manager bound to a new database connection, for one worker thread."""
@@ -189,6 +210,7 @@ class CareerManager:
         )
         m.events, m._events_lock, m._halt = self.events, self._events_lock, self._halt
         m._lease_lost = self._lease_lost
+        m._cancel, m._cancel_reason = self._cancel, self._cancel_reason
         return m
 
     def _decide_record(
@@ -523,7 +545,15 @@ class CareerManager:
                 local.manager = m
                 with clones_lock:
                     clones.append(m)
-            return m._execute_claimed(objective_id, fence)
+            try:
+                return m._execute_claimed(objective_id, fence)
+            except SessionCancelledError as exc:
+                # A safe point: hand the task back with an ownership-checked transition.
+                try:
+                    exc.released = m._release_for_shutdown(fence, grace_expired=False)
+                except sqlite3.Error:
+                    exc.released = None  # the dispatcher retries from its own connection
+                raise
 
         running: dict[Future[str], Fence] = {}
         deferred: set[int] = set()  # waiting for a concurrent reservation to settle
@@ -533,6 +563,10 @@ class CareerManager:
         stop_reason: str | None = None
         crash: SessionTerminatedError | None = None
         halted = False
+        grace = self.config.limits.shutdown_grace_seconds
+        cancel_deadline: float | None = None  # monotonic; set when a shutdown is requested
+        unreleased: list[Fence] = []  # stopped workers whose task could not be handed back
+        abandoned_workers = 0  # still inside provider calls when the grace period expired
         pool = ThreadPoolExecutor(max_workers=limit, thread_name_prefix="careeros-worker")
         try:
             while True:
@@ -540,8 +574,22 @@ class CareerManager:
                     # Ownership cannot be renewed safely: stop dispatching, halt workers.
                     halted = True
                     self._log("HEARTBEAT FAILURE: leases cannot be renewed; halting workers.")
+                if self._cancel.is_set() and cancel_deadline is None:
+                    # Controlled shutdown: dispatch nothing more; workers stop at safe points.
+                    cancel_deadline = time.monotonic() + grace
+                    self._log(
+                        f"SHUTDOWN REQUESTED ({self._cancel_text()}): no new work; "
+                        f"{len(running)} worker(s) stopping at a safe point "
+                        f"(grace {grace:g} s)."
+                    )
+                cancelling = cancel_deadline is not None
                 obj = self.repo.get_objective(objective_id)
-                active = obj.status is ObjectiveStatus.ACTIVE and crash is None and not halted
+                active = (
+                    obj.status is ObjectiveStatus.ACTIVE
+                    and crash is None
+                    and not halted
+                    and not cancelling
+                )
                 done_now = active and self._done(obj)
                 quota_left = max_attempts is None or len(counted) < max_attempts
                 if active and not done_now:
@@ -570,6 +618,9 @@ class CareerManager:
                     if halted:
                         stop_reason = "halted: lease renewal failed"
                         break
+                    if cancelling:
+                        stop_reason = f"cancelled: {self._cancel_text()}"
+                        break
                     if not active:
                         stop_reason = obj.stop_reason
                         break
@@ -593,7 +644,10 @@ class CareerManager:
                         break
                     stop_reason = self._settle_idle(obj, session)
                     break
-                finished, _ = wait(running, return_when=FIRST_COMPLETED, timeout=0.5)
+                timeout = 0.5
+                if cancel_deadline is not None:
+                    timeout = max(0.0, min(timeout, cancel_deadline - time.monotonic()))
+                finished, _ = wait(running, return_when=FIRST_COMPLETED, timeout=timeout)
                 for fut in finished:
                     fence = running.pop(fut)
                     try:
@@ -604,6 +658,10 @@ class CareerManager:
                         continue
                     except SessionHaltedError:
                         continue  # stopped safely; recovery resumes the attempt
+                    except SessionCancelledError as exc:
+                        if exc.released is None and not self._retry_release(fence):
+                            unreleased.append(fence)
+                        continue
                     except OwnershipLostError as exc:
                         self._log(f"  task {fence.task_id}: ownership lost, worker stopped ({exc})")
                         continue
@@ -615,18 +673,62 @@ class CareerManager:
                     else:
                         deferred.clear()  # a settled task may have freed budget
                         idle_contention = 0
+                if (
+                    cancel_deadline is not None
+                    and running
+                    and crash is None
+                    and time.monotonic() >= cancel_deadline
+                ):
+                    # Grace period over: workers still busy (inside provider calls) lose
+                    # their tasks now, through the same conditional transition. Their
+                    # calls are abandoned (charged the reservation, as recovery does)
+                    # and any reply that still arrives is recorded as late.
+                    for fence in list(running.values()):
+                        try:
+                            self._release_for_shutdown(fence, grace_expired=True)
+                        except sqlite3.Error:
+                            if not self._retry_release(fence, grace_expired=True):
+                                unreleased.append(fence)
+                    abandoned_workers = len(running)
+                    stop_reason = (
+                        f"cancelled: {self._cancel_text()}; grace period expired with "
+                        f"{abandoned_workers} worker(s) inside provider calls"
+                    )
+                    self._log(f"SHUTDOWN: {stop_reason}; their tasks were released.")
+                    break
         finally:
-            pool.shutdown(wait=True)
+            # Workers abandoned at grace expiry may still be blocked in a provider call:
+            # do not wait for them, and keep their connections open so their late replies
+            # are still recorded (fenced, never authoritative).
+            pool.shutdown(wait=abandoned_workers == 0, cancel_futures=True)
             hb_stop.set()
             heartbeat.join()
-            for m in clones:
-                m.ctx.close()
+            if abandoned_workers == 0:
+                for m in clones:
+                    m.ctx.close()
         if crash is not None:
             # Abrupt end: the session stays open and its leases expire; the next session
             # recovers the work. Nothing is cleaned up, exactly as after a process kill.
             raise crash
-        # Ending the session (only after every worker has stopped) lets recovery take over
-        # its remaining tasks immediately instead of waiting for their leases to expire.
+        if unreleased:
+            # A task could not be handed back (database unavailable): the session is not
+            # ended, so its leases simply expire and recovery takes the work over safely.
+            stop_reason = (
+                f"{stop_reason}; {len(unreleased)} task(s) left for recovery after their "
+                "lease expires"
+            )
+            self._log(f"SHUTDOWN: {stop_reason}")
+            final = self.repo.get_objective(objective_id)
+            return RunSummary(
+                objective_id,
+                final.status,
+                len(counted),
+                self.events[start:],
+                stop_reason,
+                dispatches,
+            )
+        # Ending the session (only after no worker holds valid ownership: all stopped, or
+        # released at grace expiry) lets recovery take over its remaining tasks at once.
         self.repo.end_session(session, stop_reason or "stopped")
         final = self.repo.get_objective(objective_id)
         return RunSummary(
@@ -637,6 +739,75 @@ class CareerManager:
             stop_reason,
             dispatches,
         )
+
+    # ---------------------------------------------------------------- shutdown
+    def _release_for_shutdown(self, fence: Fence, *, grace_expired: bool) -> bool:
+        """Hand a task back on controlled shutdown, in one transaction, only if ``fence``
+        is still its owner (same generation and session, still running). The lease is
+        cleared, never extended, so an expired lease is not revived; if another session
+        has taken the task over, nothing changes. The attempt stays open, so the task
+        resumes under the same attempt number (and idempotency keys).
+
+        Calls of this generation still in flight (only at grace expiry) are abandoned and
+        charged their reservation, as recovery does; this generation's other held
+        reservations are released. Returns whether this call released the task."""
+        reason = (
+            "shutdown: grace period expired while the worker was inside a provider call"
+            if grace_expired
+            else f"shutdown requested ({self._cancel_text()}): stopped at a safe point"
+        )
+        with self.db.transaction() as c:
+            cur = c.execute(
+                "UPDATE tasks SET status='ready', lease_owner=NULL, lease_expires_at=NULL,"
+                " updated_at=? WHERE id=? AND owner_generation=? AND lease_owner=?"
+                " AND status='running'",
+                (self._now(), fence.task_id, fence.generation, fence.session),
+            )
+            if cur.rowcount != 1:
+                return False  # finished, or already taken over: not ours to release
+            calls = c.execute(
+                "SELECT * FROM model_calls WHERE task_id=? AND status='in_flight'"
+                " AND owner_generation=?",
+                (fence.task_id, fence.generation),
+            ).fetchall()
+            abandoned = self.gateway.abandon_calls_in(c, calls, reason)
+            for r in c.execute(
+                "SELECT id FROM budget_reservations WHERE status='held' AND task_id=?"
+                " AND session_id=?",
+                (fence.task_id, fence.session),
+            ).fetchall():
+                self.budgets.release_in(c, r["id"])
+            row = c.execute(
+                "SELECT objective_id FROM tasks WHERE id=?", (fence.task_id,)
+            ).fetchone()
+            self.repo.record_decision_in(
+                c,
+                "requeue",
+                objective_id=row["objective_id"],
+                task_id=fence.task_id,
+                rationale=reason,
+                inputs={
+                    "cancelled": True,
+                    "attempt": fence.attempt,
+                    "grace_expired": grace_expired,
+                    "abandoned_calls": abandoned,
+                },
+                generation=fence.generation,
+            )
+        self._log(f"  task {fence.task_id}: released on shutdown (attempt {fence.attempt} kept)")
+        return True
+
+    def _retry_release(self, fence: Fence, *, grace_expired: bool = False) -> bool:
+        """Bounded retries of a failed shutdown release from the dispatcher's own
+        connection. True once released or no longer ours; False if the database stayed
+        unavailable (the session is then left open so its leases expire)."""
+        for i in range(3):
+            try:
+                self._release_for_shutdown(fence, grace_expired=grace_expired)
+                return True
+            except sqlite3.Error:
+                time.sleep(0.05 * 2**i)
+        return False
 
     # ---------------------------------------------------------------- ownership
     def _now(self) -> str:

@@ -11,7 +11,7 @@ fails on the baseline passes after the change, and CI is green on the fixing com
 | L10 | Claim did not re-check prerequisites or objective status | C1 | **Fixed** in `523c227`; plan membership is part of C5 (N5) |
 | L5 | Requeued claims count toward per-run `max_attempts` | C2 | **Fixed** in C2 (evidence below) |
 | N6 | Hot, unbounded claim/requeue loop for a lone task under budget contention (found during C2) | C2 | **Fixed** in C2 |
-| L7 | Ctrl-C does not stop workers; no SIGTERM handling | C3 | Open |
+| L7 | Ctrl-C does not stop workers; no SIGTERM handling | C3 | **Fixed** in C3 (evidence below) |
 | L8 | `synchronous=NORMAL` | C4 | Open |
 | L9 | Planning has no heartbeat, ownership or resume (reproduced) | C5 | Open |
 | N3 | Approving a planning clarification does not re-plan | C5 | Open |
@@ -62,6 +62,37 @@ Follow-up (quota race): the quota restriction moved into the claiming statement
 (`only_attempt`). Full suite 560 passed; lint, format, types clean; coverage 96% (fencing
 100%, manager 95%); the separate-process race test 10/10; concurrency-related suites
 (123 tests) 5/5 runs.
+
+## C3 evidence
+
+Baseline (`5863660`) behaviour, reproduced by `tests/test_hardening_c3_baseline.py` (SIGINT
+to a separate process running an objective as `resume` does, two dependent steps, the first
+inside its provider call): the process raised `KeyboardInterrupt`; the interrupted worker
+nevertheless carried on to an outcome (here a retry decision that closed attempt 1); the
+session was never ended (`ended_at` NULL), so remaining work stayed leased until expiry.
+That test fails on the baseline and passes after C3 (task handed back as `ready` with
+attempt 1 still open, the dependent step not dispatched, session ended "cancelled: SIGINT").
+
+`tests/test_hardening_c3.py` (cannot be collected on the baseline: it imports the new
+shutdown module):
+
+| Requirement | Tests |
+|---|---|
+| SIGINT during idle dispatch | `test_cancel_while_idle_in_contention_backoff`, `test_sigint_during_idle_dispatch_in_a_separate_process` |
+| SIGINT / SIGTERM with active workers | `test_signal_with_active_workers_in_a_separate_process[sigint_1]`, `[sigterm_2]` |
+| Shutdown during an in-flight model call; several workers concurrently | `test_cancel_with_workers_inside_provider_calls_stops_at_safe_points[one_worker]`, `[three_workers]` |
+| Heartbeat active during grace; no takeover | `test_heartbeat_keeps_leases_alive_during_the_grace_period` |
+| Grace expiry; late reply never overwrites | `test_grace_expiry_releases_tasks_and_late_replies_never_overwrite`, `test_late_reply_after_grace_expiry_and_recovery_across_processes` |
+| Second signal / forced exit; recovery | `test_second_signal_forces_exit_and_recovery_is_deterministic` |
+| Repeated requests idempotent | `test_repeated_cancel_requests_are_idempotent`, `test_signal_handler_cancels_once_then_forces_exit` |
+| No ownership after takeover | `test_cancel_after_takeover_does_not_touch_the_new_owner` |
+| Session not ended while ownership could not be released | `test_failed_hand_back_leaves_the_session_open_for_recovery` |
+| Cancel before dispatch | `test_cancel_before_dispatch_claims_nothing` |
+
+Verification: full suite 576 passed; `ruff check`, `ruff format --check`, `mypy` clean;
+coverage 96% (`orchestration/shutdown.py` 100%, manager 94%); C3 tests 8/8 runs normally
+and 8/8 under CPU load (after fixing the forced-exit test to wait for the first signal to be
+handled: pending signals coalesce); concurrency-related suites (128 tests) 3/3 runs.
 
 ## N5 — requirements carried into C5
 

@@ -1333,3 +1333,64 @@ a generation) and the run never returned; the intended back-off never ran. Defer
 are now always skipped for the rest of the pass, and the existing bounded back-off (50 ×
 50 ms) runs before the quota check: the run stops with "budget is reserved by another
 active session" (resumable, attempt still open, no approval request).
+
+### 19.3 C3 — graceful shutdown and cancellation (L7)
+
+Before: Ctrl-C raised `KeyboardInterrupt` in the dispatcher. Workers were not told; the pool
+waited for each to run its task to an outcome (no safe stopping point); `run` raised, the
+session was never ended, so remaining work stayed leased until expiry. SIGTERM killed the
+process outright. Nothing was corrupted (every write is one fenced transaction), but the
+stop was neither prompt nor clean.
+
+Four stop modes now exist and are kept distinct:
+
+| Mode | Trigger | Workers | Tasks | Session |
+|---|---|---|---|---|
+| Completion / waiting | normal | finish | final or waiting states | ended |
+| **Controlled shutdown** (new) | `request_cancel`; the CLI's first SIGINT/SIGTERM | stop at the next safe point (`_guard`) | handed back, attempt open | ended once no worker holds ownership |
+| Heartbeat failure (Phase B) | leases cannot be renewed | halt at the next safe point | left running for recovery | ended |
+| Crash / forced exit | process death; the CLI's second signal (`os._exit(128+signum)`) | gone | left running; leases expire | not ended; recovered later |
+
+**Lifecycle of a controlled shutdown**
+
+1. `request_cancel(reason)` (or the first SIGINT/SIGTERM via
+   `orchestration.shutdown.graceful_shutdown`) only sets an event: no locks, logging or I/O
+   in the handler, so a signal cannot interrupt a transaction. Idempotent: only the first
+   request counts; the flag is never cleared by `run`.
+2. The dispatcher stops claiming at its next loop iteration (≤ 0.5 s; immediately when idle,
+   including during the contention back-off).
+3. Each worker stops at its next safe point (`_guard`, between steps) with
+   `SessionCancelledError` and hands its task back in **one conditional transaction**
+   (`_release_for_shutdown`): only if its fence is still the owner (same generation and
+   session, still `running`); the lease is cleared, never extended (an expired lease is not
+   revived); the attempt stays open (same number and idempotency keys on resume); a
+   `requeue` decision with `cancelled: true` is recorded. A worker whose task was taken
+   over meanwhile releases nothing. A model call already in flight completes normally and
+   authoritatively (the heartbeat keeps renewing the lease during the grace period); its
+   result is replayed by key on resume.
+4. If the hand-back fails (database unavailable), the dispatcher retries it (bounded) from
+   its own connection; if it still fails, the session is **not** ended - its leases expire
+   and recovery resumes the attempt.
+5. When no worker holds valid ownership, the heartbeat stops and the session ends with
+   `cancelled: <reason>`; `resume` continues immediately (no `--force-recover`).
+
+**Grace expiry** (`limits.shutdown_grace_seconds`, default 30 s): workers still inside a
+provider call lose their tasks, through the same conditional transition, from the
+dispatcher: the task becomes ready (attempt open), that generation's in-flight calls are
+abandoned and charged their reservation (as recovery does), its other held reservations
+are released, and the decision records `grace_expired: true` and the number of abandoned
+calls. Their fences are then invalid, so the session can end. The dispatcher does not wait
+for those threads (and leaves their connections open): when a provider finally replies, T2
+sees the fence is no longer valid and records a **late reply**, reconciled once, never
+authoritative, never overwriting newer work. The process itself exits when those calls
+return, or at once on a second signal.
+
+**Second signal**: immediate `os._exit(130|143)`, identical to a crash: committed work is
+durable, nothing half-written exists, and recovery after lease expiry (or
+`--force-recover`) resumes the same attempts and abandons the in-flight calls. Two signals
+delivered before the handler runs coalesce into one (POSIX signals do not queue), so a
+very fast double Ctrl-C may need a third.
+
+Scope: the CLI `resume` command installs the handlers; library callers use
+`request_cancel`. Planning (`submit`) is not yet covered - it becomes an owned, resumable
+phase in C5. The demo command is not wrapped (synthetic, seconds long).
