@@ -18,12 +18,19 @@ import pytest
 
 from careeros.context import AppContext, open_context_at
 from careeros.core.clock import utc_now
+from careeros.core.config import ModelProfile
 from careeros.core.db import from_json
 from careeros.core.errors import OwnershipLostError, SessionTerminatedError
+from careeros.cost.budget import BudgetManager
 from careeros.domain.models import TaskStatus
 from careeros.domain.repositories import OrchestrationRepository
 from careeros.llm.adapters.scripted import ScriptedAdapter
-from careeros.llm.contracts import IdempotencyMismatchError, ModelRequest, OutputSchema
+from careeros.llm.contracts import (
+    IdempotencyMismatchError,
+    ModelRequest,
+    ModelResponse,
+    OutputSchema,
+)
 from careeros.llm.gateway import CallContext, Reply
 from careeros.manager.manager import CareerManager, LeaseState
 from careeros.manager.plans import Playbook, PlaybookLibrary
@@ -212,6 +219,151 @@ def test_late_cost_reconciliation_and_duplicate_delivery(ctx: AppContext, ratio:
     assert ledger_consistent(ctx, oid) == (pytest.approx(spent1), pytest.approx(total1))
     assert _task(ctx, oid)["spent_usd"] == pytest.approx(task_spent)
     assert len(ctx.db.query("SELECT * FROM late_replies")) == 1
+
+
+# --------------------------------------------- replies for calls that were already settled
+def _accounting_snapshot(ctx: AppContext, oid: int) -> dict[str, Any]:
+    """Every value a stray reply must not change: spend at every level, reservations,
+    call rows (status, cost, idempotency key) and the authoritative results."""
+    return {
+        "budgets": [
+            tuple(r) for r in ctx.db.query("SELECT id, spent_usd, reserved_usd FROM budgets")
+        ],
+        "reservations": [
+            tuple(r)
+            for r in ctx.db.query("SELECT id, status, settled_usd FROM budget_reservations")
+        ],
+        "calls": [
+            tuple(r)
+            for r in ctx.db.query(
+                "SELECT id, status, cost_usd, input_tokens, output_tokens, overshoot_usd,"
+                " idempotency_key, response_json, provider_request_id FROM model_calls"
+            )
+        ],
+        "tasks": [
+            tuple(r)
+            for r in ctx.db.query("SELECT id, status, spent_usd, accepted_result_id FROM tasks")
+        ],
+        "results": [tuple(r) for r in ctx.db.query("SELECT * FROM task_results")],
+        "late_replies": [tuple(r) for r in ctx.db.query("SELECT * FROM late_replies")],
+        "ledger": ledger_consistent(ctx, oid),
+    }
+
+
+SETTLED_STATUSES = ["ok", "malformed", "timeout", "rate_limit", "error", "cache_hit", "late"]
+
+
+@pytest.mark.parametrize("status", SETTLED_STATUSES)
+def test_late_reply_for_an_already_settled_call_changes_nothing(
+    ctx: AppContext, status: str
+) -> None:
+    """A reply delivered (again) for a call that already completed - its reservation
+    settled, its result possibly accepted - is a duplicate: no accounting at all."""
+    lib = one_step_book()
+    m = CareerManager(ctx, playbooks=lib)
+    oid = submit(m)
+    assert m.run(oid).status.value == "done"
+    [row] = calls(ctx, purpose="task")
+    assert row["status"] == "ok"
+    call_id = int(str(row["id"]))
+    res = ctx.db.query_one(
+        "SELECT status FROM budget_reservations WHERE id=?", (row["reservation_id"],)
+    )
+    assert res is not None and res["status"] == "settled"
+    if status != "ok":  # the same settled call, finished with another terminal status
+        with ctx.db.transaction() as c:
+            c.execute("UPDATE model_calls SET status=? WHERE id=?", (status, row["id"]))
+    before = _accounting_snapshot(ctx, oid)
+    assert before["ledger"][0] == pytest.approx(before["ledger"][1])
+    for cost in (0.0001, float(str(row["cost_usd"])), 5.0):  # cheaper, equal, far dearer
+        reply = Reply("ok", None, 100, 200, 10, cost, '{"payload": {"x": 1}}', "dup-prov")
+        assert m.gateway.record_late_reply(call_id, reply) is False
+        assert _accounting_snapshot(ctx, oid) == before
+    # The authoritative call still replays by its key, unchanged.
+    if status == "ok":
+        t = _task(ctx, oid)
+        assert t["accepted_result_id"] is not None and t["status"] == "succeeded"
+        same = ctx.db.query_one(
+            "SELECT id FROM model_calls WHERE idempotency_key=?", (row["idempotency_key"],)
+        )
+        assert same is not None and same["id"] == call_id
+
+
+class _DuplicateCompletionAdapter(GatedAdapter):
+    """While the provider call is in progress, another delivery path completes the same
+    call row first (as T2 would: status, cost, reservation settled, task spend), through
+    its own connection. The original T2 then arrives second for a settled call."""
+
+    def __init__(self, ctx: AppContext, first_cost: float) -> None:
+        super().__init__(n=1)
+        self.ctx, self.first_cost = ctx, first_cost
+
+    def call(self, profile: ModelProfile, request: ModelRequest) -> ModelResponse:
+        response = super().call(profile, request)
+        with (
+            open_context_at(self.ctx.config, self.ctx.data_dir) as other,
+            other.db.transaction() as c,
+        ):
+            r = c.execute("SELECT * FROM model_calls WHERE status='in_flight'").fetchone()
+            c.execute(
+                "UPDATE model_calls SET status='ok', cost_usd=?, response_json=? WHERE id=?",
+                (self.first_cost, '{"payload": {"role_family": "first"}}', r["id"]),
+            )
+            BudgetManager.settle_in(c, r["reservation_id"], self.first_cost)
+            if r["task_id"] is not None:
+                c.execute(
+                    "UPDATE tasks SET spent_usd = spent_usd + ? WHERE id=?",
+                    (self.first_cost, r["task_id"]),
+                )
+        return response
+
+
+def test_duplicate_t2_completion_of_a_settled_call_changes_nothing(ctx: AppContext) -> None:
+    first_cost = 0.00123
+    adapter = _DuplicateCompletionAdapter(ctx, first_cost)
+    m = CareerManager(ctx, adapter=adapter, playbooks=one_step_book())
+    oid = submit(m)
+    tid = _task(ctx, oid)["id"]
+    req = ModelRequest(
+        task_type="job.classify_role",
+        prompt="classify",
+        output_schema=OutputSchema(("role_family",)),
+    )
+    key = f"task:{tid}:a1:task:0"
+    out = m.gateway.call("mock-small", req, CallContext(oid, tid, 1, "task", None, key))
+    # The second completion is reported as non-authoritative and applied nowhere.
+    assert out.status == "late" and out.payload is None, out.error
+    [row] = calls(ctx, purpose="task")
+    assert row["status"] == "ok" and row["cost_usd"] == pytest.approx(first_cost)
+    assert row["idempotency_key"] == key
+    assert from_json(str(row["response_json"]))["payload"] == {"role_family": "first"}
+    assert ctx.db.query("SELECT * FROM late_replies") == []
+    res = ctx.db.query_one("SELECT * FROM budget_reservations WHERE id=?", (row["reservation_id"],))
+    assert res is not None and res["status"] == "settled"
+    assert res["settled_usd"] == pytest.approx(first_cost)
+    assert _task(ctx, oid)["spent_usd"] == pytest.approx(first_cost)
+    spent, total = ledger_consistent(ctx, oid)
+    assert spent == pytest.approx(total) == pytest.approx(first_cost)
+    # A replay by key returns the first, authoritative completion; nothing is re-charged.
+    before = _accounting_snapshot(ctx, oid)
+    again = m.gateway.call("mock-small", req, CallContext(oid, tid, 1, "task", None, key))
+    assert again.call_id == row["id"] and again.payload == {"role_family": "first"}
+    assert m.gateway.record_late_reply(row["id"], Reply("ok", None, 1, 1, 1, 9.9, "{}")) is False
+    assert _accounting_snapshot(ctx, oid) == before
+
+
+def test_late_reply_for_in_flight_call_whose_reservation_is_gone_is_refused(
+    ctx: AppContext,
+) -> None:
+    """Defensive: an in-flight row whose reservation is no longer held cannot be settled
+    at the budget level, so the late path must not charge the task level alone."""
+    m, oid, row = _abandoned_call(ctx)
+    with ctx.db.transaction() as c:  # an inconsistent row: in flight, reservation settled
+        c.execute("UPDATE model_calls SET status='in_flight' WHERE id=?", (row["id"],))
+    before = _accounting_snapshot(ctx, oid)
+    reply = Reply("ok", None, 100, 200, 10, 0.5, "{}", "prov")
+    assert m.gateway.record_late_reply(row["id"], reply) is False
+    assert _accounting_snapshot(ctx, oid) == before
 
 
 # ====================================================================== idempotency (L1)

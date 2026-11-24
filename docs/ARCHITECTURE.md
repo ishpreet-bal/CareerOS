@@ -1211,7 +1211,10 @@ Fixes audit findings **H2, M4, M5, L1 and L4** (amendment A13, ADR 0007).
   once — a refund or extra charge against an abandoned call's conservative reservation
   charge, or settlement of a still-held reservation — task spend is adjusted, overshoot
   recorded and the adjustment marked applied. Duplicate delivery changes nothing. A late
-  reply is never used as a result and frees its idempotency key.
+  reply is never used as a result and frees its idempotency key. Late-reply accounting
+  applies only to calls that are `abandoned` or still `in_flight` with a held reservation;
+  a reply for a call that already completed (`ok`, `malformed`, `timeout`, `rate_limit`,
+  `error`, `cache_hit`, `late`) is a duplicate and writes nothing at any level.
 * `provider_request_id` is stored when the provider reports one; `client_request_id`
   (our local key) is passed to adapters, which may use provider-side de-duplication if they
   declare `supports_provider_idempotency`. CareerOS's correctness never depends on it.

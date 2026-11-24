@@ -373,7 +373,17 @@ class ModelGateway:
           ``actual - R`` - a refund if the reply was cheaper, a charge if dearer;
         * call still ``in_flight`` but ownership lost: settle its held reservation at the
           actual cost, mark the call ``late``.
+
+        Any other status (``ok``, ``malformed``, ``timeout``, ``rate_limit``, ``error``,
+        ``cache_hit``, or ``late`` already) means the call was already accounted for:
+        its reservation is settled and its result, if any, is authoritative. Such a reply
+        is a duplicate delivery and changes nothing - no late-reply row, no spend at any
+        level, no reservation, status or idempotency-key change. Returns False.
         """
+        if row["status"] not in ("abandoned", "in_flight"):
+            return False
+        if row["status"] == "in_flight" and not self._reservation_unresolved(c, row):
+            return False  # nothing left to settle: refuse rather than charge one level only
         reserved = float(row["reserved_usd"] if row["reserved_usd"] is not None else 0.0)
         charged_before = float(row["cost_usd"] or 0.0) if row["status"] == "abandoned" else 0.0
         actual = reply.cost_usd
@@ -444,6 +454,17 @@ class ModelGateway:
             ),
         )
         return True
+
+    @staticmethod
+    def _reservation_unresolved(c: Any, row: Any) -> bool:
+        """An in-flight call's reservation must still be held for late settlement to apply
+        the same amount to the budgets and the task (or the call had no reservation)."""
+        if row["reservation_id"] is None:
+            return True
+        r = c.execute(
+            "SELECT status FROM budget_reservations WHERE id=?", (row["reservation_id"],)
+        ).fetchone()
+        return r is not None and r["status"] == "held"
 
     @staticmethod
     def _reservation_budget_ids(c: Any, reservation_id: int | None) -> list[int]:
