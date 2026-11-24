@@ -51,3 +51,8 @@ class SessionCancelledError(CareerOSError):
     #: Set by the worker after its hand-back: True (released), False (no longer the
     #: owner: finished or taken over), None (the database was unavailable; retry).
     released: bool | None = True
+
+
+class DurabilityError(CareerOSError):
+    """A database connection does not have the required durability settings (WAL journal,
+    ``synchronous=FULL``), or a backup failed verification."""

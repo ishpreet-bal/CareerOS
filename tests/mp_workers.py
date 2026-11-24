@@ -437,3 +437,70 @@ def run_like_cli(
             _report(out, stop_reason=s.stop_reason, status=s.status.value)
     except BaseException as exc:
         _report(out, raised=type(exc).__name__)
+
+
+def durability_after_recover(data_dir: str, objective_id: int, out: Any) -> None:
+    """A recovering process: report the settings in effect on its own connection."""
+    try:
+        with _ctx(data_dir) as c:
+            m = _manager(c, None, offset=10.0)
+            m._recover(objective_id, c.orchestration.start_session())
+            _report(out, durability=c.db.durability())
+    except BaseException:
+        _report(out, error=traceback.format_exc())
+
+
+#: Crash points around a model call's reservation (T1) and settlement (T2).
+CRASH_POINTS = ("after_reserve", "after_reply", "inside_settlement", "after_settlement")
+
+
+def crash_at(data_dir: str, objective_id: int, book: dict[str, Any], point: str, out: Any) -> None:
+    """Run an objective and kill the process abruptly (``os._exit``) at ``point``:
+
+    * ``after_reserve`` - T1 committed (reservation held, call in flight), before the
+      provider is called;
+    * ``after_reply`` - the provider replied, before T2 starts;
+    * ``inside_settlement`` - inside T2, after the call row was updated and while the
+      reservation is being settled, before COMMIT;
+    * ``after_settlement`` - T2 committed, before the next step.
+    """
+    try:
+        from careeros.cost.budget import BudgetManager
+        from careeros.llm.adapters.mock import MockAdapter
+
+        def die() -> None:
+            _report(out, died_at=point)
+            time.sleep(0.2)
+            os._exit(17)
+
+        class Crashing(MockAdapter):
+            mode_label: ClassVar[str] = "mock"
+
+            def call(self, profile: Any, request: Any) -> Any:
+                if request.task_type == "quality.review":
+                    return super().call(profile, request)
+                if point == "after_reserve":
+                    die()
+                reply = super().call(profile, request)
+                if point == "after_reply":
+                    die()
+                return reply
+
+        if point == "inside_settlement":
+            orig = BudgetManager.settle_in
+
+            def settle_in(c: Any, reservation_id: int, actual: float) -> None:
+                orig(c, reservation_id, actual)
+                die()  # the transaction is still open: it must roll back entirely
+
+            BudgetManager.settle_in = staticmethod(settle_in)  # type: ignore[method-assign]
+
+        def hook(p: str, task: Any) -> None:
+            if point == "after_settlement" and p == "after_model_response":
+                die()
+
+        with _ctx(data_dir) as c:
+            _manager(c, book, adapter=Crashing(), fault_hook=hook).run(objective_id)
+            _report(out, status="finished-without-crashing")
+    except BaseException:
+        _report(out, error=traceback.format_exc())

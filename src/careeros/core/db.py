@@ -19,9 +19,20 @@ from typing import Any
 
 from careeros.core.clock import utc_now_iso
 from careeros.core.config import DatasetKind
-from careeros.core.errors import DatasetKindMismatchError, MigrationError
+from careeros.core.errors import DatasetKindMismatchError, DurabilityError, MigrationError
 
 DB_FILENAME = "careeros.db"
+
+#: Durability settings applied to, and verified on, every file-backed connection (audit
+#: L8). In WAL mode ``synchronous=FULL`` syncs the WAL on every commit, so a committed
+#: transaction (a reservation, a call record, a settlement) survives an operating-system
+#: crash or power loss - provided the storage honours fsync. ``NORMAL`` (used before) only
+#: survived application crashes: the last commits could roll back after power loss.
+#: ``fullfsync`` makes those syncs use F_FULLFSYNC on macOS (whose plain fsync does not
+#: flush the drive's cache); it is ignored on other platforms.
+REQUIRED_JOURNAL_MODE = "wal"
+REQUIRED_SYNCHRONOUS = 2  # FULL
+_SYNCHRONOUS_NAMES = {0: "OFF", 1: "NORMAL", 2: "FULL", 3: "EXTRA"}
 _MIGRATION_RE = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 
 
@@ -76,11 +87,14 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 30000")
-        if str(p) != ":memory:":
-            _set_wal(conn)
-            conn.execute("PRAGMA synchronous = NORMAL")
         db = cls(conn, None if str(p) == ":memory:" else p)
         try:
+            if str(p) != ":memory:":
+                _set_wal(conn)
+                conn.execute("PRAGMA synchronous = FULL")
+                conn.execute("PRAGMA fullfsync = ON")
+                conn.execute("PRAGMA checkpoint_fullfsync = ON")
+                db.verify_durability()
             if migrate:
                 db.migrate()
             db._bind_dataset_kind(dataset_kind)
@@ -91,6 +105,33 @@ class Database:
 
     def close(self) -> None:
         self.conn.close()
+
+    # ------------------------------------------------------------------ durability
+    def durability(self) -> dict[str, Any]:
+        """The settings actually in effect on this connection (read back from SQLite)."""
+        sync = int(self.conn.execute("PRAGMA synchronous").fetchone()[0])
+        return {
+            "journal_mode": str(self.conn.execute("PRAGMA journal_mode").fetchone()[0]).lower(),
+            "synchronous": _SYNCHRONOUS_NAMES.get(sync, str(sync)),
+            "synchronous_level": sync,
+            "fullfsync": bool(self.conn.execute("PRAGMA fullfsync").fetchone()[0]),
+        }
+
+    def verify_durability(self) -> None:
+        """Raise ``DurabilityError`` unless this file-backed connection uses WAL with
+        ``synchronous`` at least FULL. Checked on every open, so a connection can never
+        silently run with weaker settings (e.g. WAL unavailable on the filesystem)."""
+        if self.path is None:
+            return  # in-memory databases have nothing to make durable
+        d = self.durability()
+        if (
+            d["journal_mode"] != REQUIRED_JOURNAL_MODE
+            or d["synchronous_level"] < REQUIRED_SYNCHRONOUS
+        ):
+            raise DurabilityError(
+                f"{self.path}: journal_mode={d['journal_mode']}, synchronous={d['synchronous']};"
+                f" required journal_mode={REQUIRED_JOURNAL_MODE}, synchronous=FULL"
+            )
 
     def __enter__(self) -> Database:
         return self

@@ -10,13 +10,16 @@ import typer
 
 from careeros import __version__
 from careeros.context import open_context
+from careeros.core.backup import backup_database, restore_database, verify_backup
+from careeros.core.clock import utc_now
 from careeros.core.config import AppConfig, load_config
+from careeros.core.db import DB_FILENAME
 from careeros.core.errors import CareerOSError
 from careeros.cost.report import build_report, format_report
 from careeros.manager.manager import CareerManager
 from careeros.orchestration.shutdown import graceful_shutdown
 from careeros.simulation import SCENARIOS, run_scenario
-from careeros.storage.location import resolve_data_dir
+from careeros.storage.location import find_git_root, resolve_data_dir
 from careeros.synthetic import seed_synthetic
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="CareerOS (mock mode only).")
@@ -195,6 +198,77 @@ def approve(
     except CareerOSError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(1) from exc
+
+
+def _outside_git(path: Path) -> Path:
+    """Backups contain everything in the database (including any personal data): like the
+    data directory, they may never be written inside a git working tree (ADR 0001)."""
+    root = find_git_root(path.parent if not path.exists() else path)
+    if root is not None:
+        typer.secho(
+            f"Refusing {path}: it is inside the git repository at {root}.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+    return path
+
+
+@app.command()
+def backup(
+    to: Annotated[
+        Path | None, typer.Option("--to", help="Backup file (default: <data dir>/backups/).")
+    ] = None,
+    config_dir: ConfigDirOpt = None,
+) -> None:
+    """Write a verified online backup of the database (safe while CareerOS is running)."""
+    cfg = _load(config_dir)
+    try:
+        data_dir = resolve_data_dir(cfg.storage)
+        stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
+        dest = _outside_git(to or data_dir / "backups" / f"careeros-{stamp}.db")
+        result = backup_database(data_dir / DB_FILENAME, dest)
+    except (CareerOSError, OSError) as exc:
+        typer.secho(f"Backup failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Backup written and verified: {result.summary()}")
+
+
+@app.command("verify-backup")
+def verify_backup_cmd(path: Path) -> None:
+    """Check a backup file (integrity_check, foreign keys, CareerOS schema)."""
+    result = verify_backup(path)
+    if not result.ok:
+        typer.secho(result.summary(), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    typer.echo(result.summary())
+
+
+@app.command()
+def restore(
+    path: Path,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Restore even if a CareerOS session appears to be running."),
+    ] = False,
+    config_dir: ConfigDirOpt = None,
+) -> None:
+    """Replace the database with a verified backup (the current one is saved first)."""
+    cfg = _load(config_dir)
+    try:
+        data_dir = resolve_data_dir(cfg.storage)
+        restored, saved = restore_database(
+            path,
+            data_dir / DB_FILENAME,
+            expected_dataset_kind=cfg.storage.dataset_kind,
+            force=force,
+        )
+    except (CareerOSError, OSError) as exc:
+        typer.secho(f"Restore failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    if saved is not None:
+        typer.echo(f"Previous database saved to {saved}")
+    typer.echo(f"Restored: {restored.summary()}")
 
 
 @config_app.command("validate")

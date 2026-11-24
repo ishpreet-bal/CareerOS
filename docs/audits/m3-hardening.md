@@ -12,7 +12,7 @@ fails on the baseline passes after the change, and CI is green on the fixing com
 | L5 | Requeued claims count toward per-run `max_attempts` | C2 | **Fixed** in C2 (evidence below) |
 | N6 | Hot, unbounded claim/requeue loop for a lone task under budget contention (found during C2) | C2 | **Fixed** in C2 |
 | L7 | Ctrl-C does not stop workers; no SIGTERM handling | C3 | **Fixed** in C3 (evidence below) |
-| L8 | `synchronous=NORMAL` | C4 | Open |
+| L8 | `synchronous=NORMAL` | C4 | **Fixed** in C4 (evidence below) |
 | L9 | Planning has no heartbeat, ownership or resume (reproduced) | C5 | Open |
 | N3 | Approving a planning clarification does not re-plan | C5 | Open |
 | N5 | Partial plan installation (found during C1) | C5 | Open — requirements below |
@@ -93,6 +93,32 @@ Verification: full suite 576 passed; `ruff check`, `ruff format --check`, `mypy`
 coverage 96% (`orchestration/shutdown.py` 100%, manager 94%); C3 tests 8/8 runs normally
 and 8/8 under CPU load (after fixing the forced-exit test to wait for the first signal to be
 handled: pending signals coalesce); concurrency-related suites (128 tests) 3/3 runs.
+
+## C4 evidence
+
+`tests/test_hardening_c4_baseline.py` (raw `PRAGMA` reads; runs on any version):
+`test_all_connection_paths_use_wal_and_synchronous_full` fails on the baseline
+(`1223d03`: `('wal', 1)`, i.e. synchronous=NORMAL, on the main connection - and every other
+path) and passes after C4 for the main, worker, heartbeat and direct-open connections.
+`test_process_crash_around_reservation_and_settlement[after_reserve | after_reply |
+inside_settlement | after_settlement]` pass on **both**: process-crash atomicity already held
+and still holds. These are process-kill tests; they are not evidence of power-loss
+durability (see ARCHITECTURE section 19.4).
+
+`tests/test_hardening_c4.py` (imports the new backup module, so it cannot be collected on
+the baseline): durability of every connection path including a recovering separate process;
+refusal to open with weaker settings; backup while in use (lease, reservation, in-flight
+call and a concurrent writer) is a consistent snapshot and does not disturb the run;
+overwrite protection; a backup failing verification leaves nothing; verification of page
+corruption, truncation, non-SQLite files, `integrity_check` row findings, foreign-key
+violations, non-CareerOS and missing files; restore from a valid backup (with a verified
+safety copy); refusal of corrupt and wrong-dataset backups with the database untouched;
+refusal while a session is running; restore of a mid-run snapshot followed by recovery
+keeps ownership, budget and late-reply guarantees; CLI backup/verify/restore and refusal of
+a destination inside the git repository.
+
+Verification: full suite 596 passed; `ruff check`, `ruff format --check`, `mypy` clean;
+coverage 96% (`core/backup.py` 93%: uncovered lines are defensive error branches).
 
 ## N5 — requirements carried into C5
 

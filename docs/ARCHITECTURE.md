@@ -1394,3 +1394,60 @@ very fast double Ctrl-C may need a third.
 Scope: the CLI `resume` command installs the handlers; library callers use
 `request_cancel`. Planning (`submit`) is not yet covered - it becomes an owned, resumable
 phase in C5. The demo command is not wrapped (synthetic, seconds long).
+
+### 19.4 C4 — durability, backup and restore (L8)
+
+**Connections.** Every SQLite connection is created by `Database.open`: the main context
+(`open_context[_at]`), each worker's own connection (`CareerManager._clone`), the heartbeat's
+connection (`Database.open(..., migrate=False)`), recovery (the main connection of whichever
+process recovers) and the personal store (which shares the context's connection). Each file
+connection now sets `journal_mode=WAL`, `synchronous=FULL`, `fullfsync=ON` and
+`checkpoint_fullfsync=ON`, then **reads the settings back** (`Database.durability()`) and
+refuses to open (`DurabilityError`) if WAL or FULL did not take effect - for example on a
+filesystem where WAL is unavailable. In-memory databases are exempt. Before C4 every
+connection used `synchronous=NORMAL`.
+
+**What is guaranteed, and what is not.**
+
+| Failure | Before (WAL + NORMAL) | Now (WAL + FULL) |
+|---|---|---|
+| Process crash, kill, `os._exit`, Ctrl-C twice | Committed transactions survive; atomic | Same |
+| OS crash or power loss | Database stays consistent, but the most recent commits can roll back (e.g. a reservation or a settlement the process already acted on) | A transaction whose `COMMIT` returned is on stable storage - **if** the storage honours fsync |
+| Storage that ignores or reorders flushes (some USB/consumer drives, some VMs), network filesystems (NFS/SMB, cloud-synced folders) | Not safe | Still not safe: WAL needs a local filesystem with working locks and shared memory; durability needs honest fsync |
+
+`fullfsync` matters on macOS, whose plain `fsync` does not flush the drive cache; it is
+ignored elsewhere. The cost is one WAL sync per commit: the test suite (thousands of tiny
+transactions on a container disk) went from about 62 s to 86 s; interactive use, a few
+commits per model call, is not measurably affected.
+
+What the tests prove: the settings on every connection type; atomicity and recovery after
+a **process** crash at each boundary of a model call's reservation (T1) and settlement (T2)
+- killed after T1, after the provider replied, inside T2 before COMMIT, and after T2. They
+do **not** prove power-loss durability: that rests on SQLite's documented `synchronous=FULL`
+behaviour and on the storage, and would need real hardware or filesystem fault injection.
+
+**Backup** (`careeros backup [--to PATH]`, `core.backup.backup_database`). Uses SQLite's
+online backup API - never a file copy, which could miss committed transactions still in the
+`-wal` file or capture a torn write. One read transaction yields a consistent snapshot; in
+WAL mode readers do not block writers, so workers, leases, heartbeats and reservations
+carry on (tested with a run holding a lease, a reservation and an in-flight call while
+another connection kept committing). The snapshot is written to a temporary file in the
+destination directory, converted to a self-contained single file (`journal_mode=DELETE`),
+checked with `integrity_check` and `foreign_key_check` and the CareerOS schema markers,
+fsynced and atomically renamed: a destination either holds a verified backup or nothing.
+Backups contain everything in the database, including any personal data; the CLI refuses a
+destination inside a git working tree (ADR 0001) and defaults to `<data dir>/backups/`.
+Blobs (`<data dir>/blobs/`) are files and are not part of a database backup.
+
+**Verify** (`careeros verify-backup PATH`): read-only; reports missing files, files that are
+not SQLite, page-level corruption, `integrity_check` findings, foreign-key violations and
+non-CareerOS databases, each with a clear message and exit status 1.
+
+**Restore** (`careeros restore PATH [--force]`): verifies the backup and its dataset kind
+(synthetic and personal are never mixed), refuses while a CareerOS session is running
+(unless forced), saves the current database as a verified `*.pre-restore-<time>.db`, then
+copies the backup **into** the live database through the backup API (under SQLite's locks:
+other connections see the old or the new database, never a mixture), and verifies the
+result. A restored mid-run snapshot behaves exactly like a crash at that moment: recovery
+resumes open attempts, abandons in-flight calls (charged their reservation) and reconciles
+any late reply once.
