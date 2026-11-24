@@ -34,6 +34,7 @@ from careeros.core.config import EFFORT_ORDER, DatasetKind, Effort
 from careeros.core.db import Database, from_json, to_json
 from careeros.core.errors import (
     CareerOSError,
+    FactualGateError,
     NotFoundError,
     OwnershipLostError,
     SessionCancelledError,
@@ -68,6 +69,14 @@ from careeros.manager.plans import (
     waves,
 )
 from careeros.orchestration.fencing import CLAIMABLE_SQL, Fence, check_fence, claim
+from careeros.quality.factual import (
+    FACTUAL_POLICY_VERSION,
+    REVIEW_POLICY_VERSION,
+    check_claims,
+    check_review,
+    fingerprint,
+    sources_for,
+)
 from careeros.routing.complexity import estimate_complexity
 from careeros.routing.router import Candidate, Escalation, RouteDecision, Router
 from careeros.routing.stats import RoutingStatsRepository
@@ -1566,15 +1575,20 @@ class CareerManager:
         if task.kind == "planning":
             return self._execute_planning(obj, task, fence)
         spec = self._step(task)
+        params = {**task.input.get("objective_inputs", {}), **spec.params}
+        deps = self._deps_outputs(task)
+        factual = self.config.routing.policy(spec.task_type).factual
         step = StepContext(
             step_id=spec.id,
             task_type=spec.task_type,
             title=spec.title or spec.task_type,
             instructions=spec.instructions,
-            params={**task.input.get("objective_inputs", {}), **spec.params},
-            deps=self._deps_outputs(task),
+            params=params,
+            deps=deps,
             output_schema=spec.output.to_schema(),
             feedback=self._pending_feedback(task.id, fence.attempt),
+            factual=factual,
+            sources=sources_for(params, deps) if factual else {},
         )
         row = self.db.query_one("SELECT mode FROM tasks WHERE id=?", (task.id,))
         if row is not None and row["mode"] == "deterministic":
@@ -1838,6 +1852,7 @@ class CareerManager:
                         if "true_complexity" in spec.params
                         else {}
                     ),
+                    **({"factual_sources": step.sources} if step.factual else {}),
                 },
             )
             self._guard()
@@ -1951,19 +1966,82 @@ class CareerManager:
                 problem = "needs_input"
             elif result.confidence < self.config.routing.confidence_threshold:
                 problem, detail = "low_confidence", f"confidence {result.confidence:.2f}"
+        if outcome.cache_hit and sim_quality is None:
+            # Simulation only: a cached payload carries no hidden simulated quality, so the
+            # mock reviewer is given the result's own confidence as its hint.
+            sim_quality = result.confidence
+        # ---- factual evidence check (audit L11): deterministic, before any review -------
+        payload_hash = fingerprint(outcome.payload)
+        sources_hash = fingerprint(step.sources)
+        fact = check_claims(result, step.sources) if step.factual and problem is None else None
         self._guard()
         with self._owned(fence) as c:
             stored = self.repo.record_result_in(
                 c, task.id, attempt, result, effective_confidence=round(result.confidence, 4)
             )
-        review_enabled = spec.review if spec.review is not None else task.important
-        if outcome.cache_hit and review_enabled:
-            # Only accepted (already reviewed) results are cached; do not pay to re-review.
-            review_enabled = False
-            self._log(f"  [{spec.id}] cache hit on a previously reviewed result: $0, no review")
-        if problem is None and review_enabled:
+            if fact is not None:  # recorded with the result it judged, atomically
+                self._record_check_in(
+                    c,
+                    fence,
+                    task.id,
+                    stored.id,
+                    "evidence",
+                    "deterministic",
+                    FACTUAL_POLICY_VERSION,
+                    payload_hash,
+                    sources_hash,
+                    fact.passed,
+                    fact.to_dict(),
+                )
+        if fact is not None and not fact.passed:
+            problem, detail = "factual_unsupported", "; ".join(fact.violations)
+        # A factual result always needs an independent review, whatever its priority.
+        review_enabled = step.factual or (
+            spec.review if spec.review is not None else task.important
+        )
+        review_policy = FACTUAL_POLICY_VERSION if step.factual else REVIEW_POLICY_VERSION
+        reused = None
+        if outcome.cache_hit and review_enabled and problem is None:
+            # A cache hit saves generation, never review (audit N4): a prior review stands
+            # in only under the exact conditions of ``_reusable_review``.
+            reused = self._reusable_review(review_policy, payload_hash, sources_hash, model_id)
+        if reused is not None:
+            prior = from_json(reused["details"], {})
+            with self._owned(fence) as c:
+                self._record_check_in(
+                    c,
+                    fence,
+                    task.id,
+                    stored.id,
+                    "review",
+                    str(reused["checker"]),
+                    review_policy,
+                    payload_hash,
+                    sources_hash,
+                    True,
+                    {**prior, "reused": True},
+                    reused_from=int(reused["id"]),
+                )
+            score = prior.get("score")
+            self._log(
+                f"  [{spec.id}] cache hit: reusing review #{reused['id']} of the identical "
+                "payload under the current policy"
+            )
+        elif problem is None and review_enabled:
+            if outcome.cache_hit:
+                self._log(f"  [{spec.id}] cache hit with no reusable review: reviewing")
             verdict, score, issues = self._review(
-                fence, obj, task, spec, result, stored.id, model_id, sim_quality
+                fence,
+                obj,
+                task,
+                spec,
+                result,
+                stored.id,
+                model_id,
+                sim_quality,
+                sources=step.sources if step.factual else None,
+                payload_hash=payload_hash,
+                sources_hash=sources_hash,
             )
             if verdict in ("unavailable", "contention"):
                 return "contention" if verdict == "contention" else "done"
@@ -2003,6 +2081,7 @@ class CareerManager:
                 outcome=outcome,
                 eff_conf=eff_conf,
                 stats=stats,
+                review_required=bool(review_enabled),
             )
             return "done"
         profile = self.gateway.profile(model_id)
@@ -2048,9 +2127,21 @@ class CareerManager:
         result_id: int,
         author_model: str,
         sim_quality: float | None,
+        *,
+        sources: dict[str, str] | None = None,
+        payload_hash: str = "",
+        sources_hash: str = "",
     ) -> tuple[str, float | None, list[str]]:
-        """Independent review by a different model where possible (architecture §7.4)."""
+        """Independent review by a different model where possible (architecture §7.4).
+
+        For a factual task (``sources`` given, audit L11) the reviewer is shown the claims,
+        their evidence and the sources, must return a verdict per verified claim, and any
+        verified claim it does not find ``supported`` turns the review into a revision
+        request (``quality.factual.check_review``). Every review is recorded in
+        ``result_checks`` with the fingerprints needed to decide whether it may be reused
+        for an identical cached payload."""
         assert task.id is not None and obj.id is not None
+        factual = sources is not None
         attempt = fence.attempt
         task_type = "quality.review"
         planned = self._checkpoint(task.id, attempt, "review_route")
@@ -2113,8 +2204,27 @@ class CareerManager:
                 f"Review this deliverable for '{spec.title}'. Criteria: specific, "
                 f"supported by evidence, matches instructions.\nInstructions: "
                 f"{spec.instructions}\nDeliverable: {json.dumps(result.output)}"
+                + (
+                    "\nFactual review: for every claim with status 'verified', judge whether its"
+                    " cited evidence quotes really support it, using only the sources below;"
+                    " return claim_verdicts as [{id, verdict}] with verdict supported,"
+                    " unsupported, contradicted or not_checkable."
+                    f"\nClaims: {to_json([c.model_dump(mode='json') for c in result.claims])}"
+                    f"\nEvidence: {to_json([e.model_dump(mode='json') for e in result.evidence])}"
+                    f"\nSources: {to_json(sources)}"
+                    if factual
+                    else ""
+                )
             ),
-            output_schema=OutputSchema(("verdict", "score"), {"score": "number"}, kind="review"),
+            output_schema=(
+                OutputSchema(
+                    ("verdict", "score", "claim_verdicts"),
+                    {"score": "number", "claim_verdicts": "list"},
+                    kind="review",
+                )
+                if factual
+                else OutputSchema(("verdict", "score"), {"score": "number"}, kind="review")
+            ),
             effort=choice.effort,
             seed_salt=f"review:{task.id}:{attempt}",
             simulation={
@@ -2124,6 +2234,17 @@ class CareerManager:
                     task_type
                 ).expected_output_tokens,
                 "accept_score": self.config.routing.review_accept_score,
+                **(
+                    {
+                        "factual_review": {
+                            "claims": [c.model_dump(mode="json") for c in result.claims],
+                            "evidence": [e.model_dump(mode="json") for e in result.evidence],
+                            "sources": sources,
+                        }
+                    }
+                    if factual
+                    else {}
+                ),
             },
         )
         self._guard()
@@ -2160,6 +2281,7 @@ class CareerManager:
             return "unavailable", None, []
         if outcome.status == "late":
             raise OwnershipLostError(f"task {task.id} review: {outcome.error}")
+        per_claim: dict[str, str] = {}
         if not outcome.ok or outcome.payload is None:
             verdict, score, issues = "escalate", None, [f"review call {outcome.status}"]
         else:
@@ -2169,8 +2291,31 @@ class CareerManager:
             issues = [str(i) for i in out.get("issues", [])]
             if verdict == "accept" and score < self.config.routing.review_accept_score:
                 verdict = "revise"
+            if factual:
+                verdict, factual_issues, per_claim = check_review(result, verdict, out)
+                issues = factual_issues + issues
         self._guard()
         with self._owned(fence) as c:
+            self._record_check_in(
+                c,
+                fence,
+                task.id,
+                result_id,
+                "review",
+                f"model:{choice.model_id}",
+                FACTUAL_POLICY_VERSION if factual else REVIEW_POLICY_VERSION,
+                payload_hash,
+                sources_hash,
+                verdict == "accept",
+                {
+                    "verdict": verdict,
+                    "score": score,
+                    "issues": issues,
+                    "claim_verdicts": per_claim,
+                    "author_model": author_model,
+                },
+                model_call_id=outcome.call_id,
+            )
             c.execute(
                 "INSERT INTO reviews (task_id, result_id, reviewer, verdict, score, issues,"
                 " model_call_id, created_at) VALUES (?,?,?,?,?,?,?,?)"
@@ -2222,6 +2367,96 @@ class CareerManager:
             latency_ms=latency,
         )
 
+    # ---------------------------------------------------------------- result checks (L11)
+    def _record_check_in(
+        self,
+        c: sqlite3.Connection,
+        fence: Fence,
+        task_id: int,
+        result_id: int,
+        kind: str,
+        checker: str,
+        policy_version: str,
+        payload_hash: str,
+        sources_hash: str,
+        passed: bool,
+        details: dict[str, Any],
+        *,
+        model_call_id: int | None = None,
+        reused_from: int | None = None,
+    ) -> None:
+        """Inside a fenced transaction: record (or, on repeated delivery / a resumed
+        attempt, replace) one check of a result. One row per (result, kind)."""
+        c.execute(
+            "INSERT INTO result_checks (task_id, attempt, result_id, owner_generation, kind,"
+            " checker, policy_version, payload_hash, sources_hash, passed, details,"
+            " model_call_id, reused_from, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(result_id, kind) DO UPDATE SET checker=excluded.checker,"
+            " policy_version=excluded.policy_version, payload_hash=excluded.payload_hash,"
+            " sources_hash=excluded.sources_hash, passed=excluded.passed,"
+            " details=excluded.details, model_call_id=excluded.model_call_id,"
+            " reused_from=excluded.reused_from, owner_generation=excluded.owner_generation",
+            (
+                task_id,
+                fence.attempt,
+                result_id,
+                fence.generation,
+                kind,
+                checker,
+                policy_version,
+                payload_hash,
+                sources_hash,
+                int(passed),
+                to_json(details),
+                model_call_id,
+                reused_from,
+                self._now(),
+            ),
+        )
+
+    def _reusable_review(
+        self, policy_version: str, payload_hash: str, sources_hash: str, author_model: str
+    ) -> Any:
+        """A prior review that may stand in for a fresh one on a cache hit (audit N4): it
+        passed, under the *current* review policy version, for an identical payload judged
+        against identical sources, and by a model other than the payload's author. Anything
+        else - a legacy cache entry with no recorded review, a review that failed or never
+        finished, a different policy version or different sources - requires a new review."""
+        return self.db.query_one(
+            "SELECT * FROM result_checks WHERE kind='review' AND passed=1"
+            " AND policy_version=? AND payload_hash=? AND sources_hash=? AND checker<>?"
+            " ORDER BY id DESC LIMIT 1",
+            (policy_version, payload_hash, sources_hash, f"model:{author_model}"),
+        )
+
+    def _gate_in(
+        self, c: sqlite3.Connection, task: Task, result_id: int, review_required: bool
+    ) -> None:
+        """Inside the accepting transaction: refuse to accept a result that lacks the
+        checks its task requires (audit L11/N4) - whatever path led here. A factual task
+        needs a passing evidence check and a passing review under the current factual
+        policy; any task that requires review needs a passing review."""
+        factual = self.config.routing.policy(task.task_type).factual
+        need: dict[str, str | None] = {}
+        if factual:
+            need = {"evidence": FACTUAL_POLICY_VERSION, "review": FACTUAL_POLICY_VERSION}
+        elif review_required:
+            need = {"review": None}
+        for kind, version in need.items():
+            row = c.execute(
+                "SELECT passed, policy_version FROM result_checks WHERE result_id=? AND kind=?",
+                (result_id, kind),
+            ).fetchone()
+            if (
+                row is None
+                or not row["passed"]
+                or (version is not None and row["policy_version"] != version)
+            ):
+                raise FactualGateError(
+                    f"task {task.id}: result {result_id} cannot be accepted without a passing "
+                    f"{kind} check" + (f" under {version}" if version else "")
+                )
+
     def _accept(
         self,
         fence: Fence,
@@ -2234,13 +2469,16 @@ class CareerManager:
         outcome: CallOutcome | None = None,
         eff_conf: float | None = None,
         stats: StatsArgs | None = None,
+        review_required: bool = False,
     ) -> None:
         """One transaction: prune dependents (if the result asks), record the effective
         confidence, mark succeeded and close the attempt, write the decision, update routing
-        history and cache the result - or none of it."""
+        history and cache the result - or none of it. The required checks are verified
+        first, in the same transaction (``_gate_in``)."""
         assert task.id is not None and obj.id is not None
         pruned: list[str] = []
         with self._owned(fence) as c:
+            self._gate_in(c, task, result_id, review_required)
             if prune_reason is not None:
                 pruned = self._prune_in(c, fence, obj, task, prune_reason)
             if eff_conf is not None:

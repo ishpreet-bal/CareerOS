@@ -47,6 +47,7 @@ OPERATIONAL_TABLES = frozenset(
         "task_results_duplicates",
         "reviews_duplicates",
         "approvals_duplicates",
+        "result_checks",
     }
 )
 

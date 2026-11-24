@@ -287,6 +287,10 @@ class TaskTypePolicy(_Strict):
     default_effort: Effort = "none"
     important: bool = False
     deterministic_first: bool = True
+    #: Factual task types state claims about the world that later steps rely on: their
+    #: results must meet the evidence policy and pass an independent factual review
+    #: (careeros.quality.factual, audit L11) - regardless of priority or importance.
+    factual: bool = False
 
 
 _DEFAULT_FLOORS: dict[Priority, float] = {

@@ -753,8 +753,8 @@ class OrchestrationRepository:
         cur = c.execute(
             "INSERT INTO task_results (task_id, attempt, schema_version, status, output,"
             " evidence, assumptions, confidence, effective_confidence, unresolved_questions,"
-            " recommended_next_steps, metrics, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " recommended_next_steps, metrics, created_at, claims)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 task_id,
                 attempt,
@@ -769,6 +769,7 @@ class OrchestrationRepository:
                 to_json(result.recommended_next_steps),
                 to_json(result.metrics),
                 utc_now_iso(),
+                to_json([cl.model_dump(mode="json") for cl in result.claims]),
             ),
         )
         assert cur.lastrowid is not None
@@ -790,6 +791,7 @@ class OrchestrationRepository:
                     "status": r["status"],
                     "output": from_json(r["output"], {}),
                     "evidence": from_json(r["evidence"], []),
+                    "claims": from_json(r["claims"], []) if "claims" in r.keys() else [],  # noqa: SIM118
                     "assumptions": from_json(r["assumptions"], []),
                     "confidence": r["confidence"],
                     "unresolved_questions": from_json(r["unresolved_questions"], []),

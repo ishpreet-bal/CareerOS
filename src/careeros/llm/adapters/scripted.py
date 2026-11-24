@@ -8,7 +8,9 @@ several tasks of the same type run concurrently. When no directive applies, beha
 back to the seeded :class:`MockAdapter`. Thread-safe.
 
 Directives: ``success``, ``success:<quality>``, ``low_confidence``, ``fail_quality``,
-``malformed``, ``invalid``, ``timeout``, ``rate_limit``, ``review:<accept|revise|escalate>``.
+``malformed``, ``invalid``, ``timeout``, ``rate_limit``, ``review:<accept|revise|escalate>``
+(optionally ``:omit`` / ``:lax`` for a factual review), ``facts:<variant>`` (factual
+author output; see ``mock._claims``).
 """
 
 from __future__ import annotations
@@ -35,9 +37,12 @@ _KINDS = {
 def parse_directive(text: str) -> Outcome:
     head, _, arg = text.partition(":")
     if head == "review":
-        if arg not in ("accept", "revise", "escalate"):
+        verdict, _, facts = arg.partition(":")
+        if verdict not in ("accept", "revise", "escalate"):
             raise ValueError(f"Bad review directive {text!r}")
-        return Outcome("success", review_verdict=arg)
+        return Outcome("success", review_verdict=verdict, facts=facts or None)
+    if head == "facts":  # factual author behaviour (audit L11), e.g. facts:ungrounded
+        return Outcome("success", facts=arg or "ok")
     if head not in _KINDS:
         raise ValueError(f"Unknown directive {text!r}")
     return Outcome(head, quality=float(arg) if arg else None)  # type: ignore[arg-type]

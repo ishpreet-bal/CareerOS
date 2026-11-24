@@ -1586,3 +1586,62 @@ rebuilt with the scope and amount columns and kind `extra_attempts`, backfilled 
 grant's request (retry-limit grants become `extra_attempts`, budget grants get
 `extra_usd`); grants recorded twice for one request (possible before C1) archived in
 `approvals_duplicates` (the first is kept); the unique index above.
+
+### 19.7 C7 — factual evidence, independent factual review and cache safety (L11, N4)
+
+Root causes: **L11** - `research.company` results were accepted on schema shape and
+confidence (≥ 0.70); the type was not reviewed by default; `evidence` was stored but never
+checked; reviews saw only the prose output. **N4** - `_execute_model` skipped review on
+every cache hit ("only accepted, already reviewed results are cached"), but
+`mark_accepted_in` cached every accepted result, reviewed or not, and entries carried no
+record of review or policy: a review-requiring step could be accepted from the cache with
+no review.
+
+**Lifecycle of a factual result** (decision record ADR 0008):
+
+1. *Sources.* `sources_for` collects what CareerOS holds for the task: the objective's text
+   inputs (`job_posting`, `input:<name>`) and dependency outputs (`step:<id>`). The evidence
+   contract and the sources are stated in the system prompt (so they are part of the cache
+   key and replay hash).
+2. *Author.* The result lists `claims` with a status (`verified`, `unverified`,
+   `assumption`, `uncertain`) and evidence ids; evidence entries carry `id`, `source_ref`,
+   a verbatim `quote` and a `stance`. Malformed claims fail result validation (`invalid`).
+3. *Deterministic evidence check* (`check_claims`, rules E1-E5 in
+   `careeros/quality/factual.py`), recorded in `result_checks` in the same fenced
+   transaction as the result. A failure is the outcome `factual_unsupported`: one repair
+   retry with the violations as feedback, then escalation (decision table). The reviewer
+   never sees a result that failed this check.
+4. *Independent factual review* - mandatory for factual task types whatever their
+   priority - by a model other than the author, shown the claims, evidence and sources;
+   it must return a verdict per verified claim (`supported`, `unsupported`,
+   `contradicted`, `not_checkable`). `check_review` turns any verified claim not judged
+   `supported`, or missing per-claim verdicts, into a revision or escalation regardless of
+   the overall verdict. Recorded in `result_checks` with the verdicts and the review call.
+5. *Gate.* The accepting transaction (`_gate_in`) refuses (`FactualGateError`) a factual
+   result without a passing evidence check and a passing review under the current policy
+   version, and any review-requiring result without a passing review.
+6. Unverified, assumption and uncertain claims are kept, labelled, in the accepted result;
+   they are never promoted to facts.
+
+**Cache rule (N4).** A hit supplies the payload only; validation re-runs against the
+current sources; a prior review stands in for a fresh one only if it *passed*, under the
+*current* policy version, for an *identical payload* against *identical sources*, by a
+model other than the payload's author (`_reusable_review`); the reuse is recorded for the
+new result (`reused_from`). Legacy entries, failed or unfinished reviews, other policy
+versions or sources all lead to a fresh review. A policy change also changes the cache
+key (the contract is in the system prompt), so old answers are not even served.
+
+**Persistence and recovery.** Migration `0008_c7_factual_checks.sql` adds
+`task_results.claims` and `result_checks` (unique per result and kind; fingerprints,
+policy version, reasons, review call, `reused_from`). Checks are written in fenced
+transactions with the result and the review; repeated delivery or a resumed attempt
+updates the row. A crash between review and acceptance resumes the same attempt: the task
+and review calls replay by key, the checks are updated in place, and the task is accepted
+once.
+
+Test changes required by the design: tests that used `research.company` as a generic step
+now see its review calls - counts of task calls, task spend and route decisions were
+adjusted to include or exclude the review explicitly; the `budget` demo scenario and one
+CLI test were re-sized from $0.15 to $0.18 so that only the critical step asks for budget
+as before; a cached payload carries no simulated hidden quality, so the mock reviewer is
+given the result's own confidence as its hint (simulation only).

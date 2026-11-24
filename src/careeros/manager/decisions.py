@@ -17,6 +17,7 @@ Outcome = Literal[
     "review_escalate",
     "review_reject",
     "needs_input",
+    "factual_unsupported",
 ]
 Action = Literal[
     "accept",
@@ -72,6 +73,12 @@ def decide(outcome: Outcome, s: AttemptState) -> Decision:
         if s.repair_retries < 1:
             return Decision("retry_with_feedback", f"{outcome} output; one repair retry")
         return escalate(f"{outcome} output after a repair retry", prefer_effort=False)
+    if outcome == "factual_unsupported":
+        # The evidence policy was not met (audit L11): one retry with the violations as
+        # feedback, then a stronger model; never accepted as it stands.
+        if s.repair_retries < 1:
+            return Decision("retry_with_feedback", "evidence policy not met; one repair retry")
+        return escalate("evidence policy not met after a repair retry", prefer_effort=False)
     if outcome in ("low_confidence", "review_revise"):
         return escalate(f"{outcome}: more reasoning should help", prefer_effort=True)
     return escalate(f"{outcome}: needs a stronger model", prefer_effort=False)

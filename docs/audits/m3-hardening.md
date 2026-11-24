@@ -17,8 +17,8 @@ fails on the baseline passes after the change, and CI is green on the fixing com
 | N3 | Approving a planning clarification does not re-plan | C5 | **Fixed** in C5 |
 | N5 | Partial plan installation (found during C1) | C5 | **Fixed** in C5 (all five requirements below) |
 | L12 | Approvals have no expiry or caps | C6 | **Fixed** in C6 (evidence below) |
-| L11 | No factual-accuracy policy | C7 | Open |
-| N4 | Cached accepted results skip review (factual policy version) | C7 | Open |
+| L11 | No factual-accuracy policy | C7 | **Fixed** in C7 (evidence below) |
+| N4 | Cached accepted results skip review (factual policy version) | C7 | **Fixed** in C7 |
 | L6 | Worker-failure/T2 failure paths | C8 | Verified consistent by inspection; failure-injection tests pending |
 | T1 | Timing-sensitive heartbeat test | C8 | Open — brief below |
 | T2 | `test_backup_while_in_use_is_consistent_and_does_not_disturb_workers` (C4) asserted exactly one in-flight call in the snapshot; the second, concurrent step's call can also be in flight (seen on CI run #14) | C5 | **Fixed**: asserts the snapshot's consistency instead (every in-flight call has exactly its own held reservation); 10/10 under CPU load |
@@ -179,6 +179,32 @@ archiving; limit defaults come from existing settings.
 
 Verification: full suite 645 passed; `ruff check`, `ruff format --check`, `mypy` clean;
 coverage 96% (manager 94%, config 96%).
+
+## C7 evidence
+
+`tests/test_hardening_c7_baseline.py` (public behaviour only) - both fail on the baseline
+(`c35112c`) and pass after C7: a research result asserting an employer fact from an
+invented web citation, with confidence 0.99 and no checkable claims, was accepted with no
+review; a review-requiring step served a cached result from an earlier unreviewed
+acceptance was accepted with no review record.
+
+`tests/test_hardening_c7.py` (37 tests): every evidence rule (no claims, duplicate ids,
+missing, unknown, ungrounded, empty-quote, web, unheld-source and contradicted evidence);
+confidence never substitutes; labelled-only results; source assembly; the review
+contract (missing or partial per-claim verdicts, unsupported / contradicted /
+not-checkable claims); supported research accepted with both checks recorded and an
+independent reviewer; each evidence failure repaired with feedback and never reviewed or
+accepted; malformed claims; an unsupported claim caught only by the reviewer; a review
+without per-claim verdicts; a lax reviewer cannot rescue ungrounded evidence; the
+acceptance gate (no checks, evidence only, wrong policy version, both); idempotent check
+recording; cache reuse only of a matching passing review; fresh review after a failed
+review, another policy version, other sources or a same-model reviewer; legacy cache
+entries; a policy change misses the cache; a cached payload that no longer meets the
+evidence rules is not accepted; crash between review and acceptance recovers with no
+duplicate calls or checks; migration.
+
+Verification: full suite 684 passed; `ruff check`, `ruff format --check`, `mypy` clean;
+coverage 96% (`quality/factual.py` 98%, manager 94%, mock adapter 97%).
 
 ## N5 — requirements carried into C5
 

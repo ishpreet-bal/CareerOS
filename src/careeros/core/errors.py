@@ -56,3 +56,8 @@ class SessionCancelledError(CareerOSError):
 class DurabilityError(CareerOSError):
     """A database connection does not have the required durability settings (WAL journal,
     ``synchronous=FULL``), or a backup failed verification."""
+
+
+class FactualGateError(CareerOSError):
+    """A result was about to be accepted without the evidence check or review its task
+    requires (audit L11/N4). The accepting transaction is rolled back."""

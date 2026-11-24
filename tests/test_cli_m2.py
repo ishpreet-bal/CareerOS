@@ -28,7 +28,12 @@ def test_approve_and_resume_flow(cfg: AppConfig) -> None:
         m = CareerManager(ctx)
         oid = m.submit(
             ObjectiveRequest(
-                title="x", kind="demo_application_package", inputs=SYNTHETIC_JOB, budget_usd=0.15
+                # Sized so that only the critical step asks (research now has a factual
+                # review, C7).
+                title="x",
+                kind="demo_application_package",
+                inputs=SYNTHETIC_JOB,
+                budget_usd=0.18,
             )
         )
         m.run(oid)

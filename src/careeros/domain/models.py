@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -382,6 +382,32 @@ class Evidence(_Model):
     source_type: EvidenceSource
     source_ref: str
     quote: str | None = None
+    #: Referenced by ``Claim.evidence`` (factual results, audit L11).
+    id: str | None = None
+    #: Whether the quoted source supports or contradicts the claim.
+    stance: Literal["supports", "contradicts"] = "supports"
+
+
+class ClaimStatus(StrEnum):
+    """How much a claim may be relied on (audit L11). Only ``verified`` claims - each with
+    evidence quoted from a source CareerOS actually holds - may be used as facts; the
+    others are carried, clearly labelled, and never presented as established."""
+
+    VERIFIED = "verified"
+    UNVERIFIED = "unverified"
+    ASSUMPTION = "assumption"
+    UNCERTAIN = "uncertain"
+
+
+class Claim(_Model):
+    id: str
+    text: str
+    status: ClaimStatus
+    #: Ids of ``Evidence`` entries supporting (or contradicting) the claim.
+    evidence: list[str] = Field(default_factory=list)
+    #: A material claim is one the deliverable relies on; all claims are material unless
+    #: explicitly marked otherwise.
+    material: bool = True
 
 
 class WorkerResult(_Model):
@@ -391,6 +417,8 @@ class WorkerResult(_Model):
     status: ResultStatus
     output: dict[str, Any] = Field(default_factory=dict)
     evidence: list[Evidence] = Field(default_factory=list)
+    #: Factual claims (required for factual task types such as ``research.company``).
+    claims: list[Claim] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
     unresolved_questions: list[str] = Field(default_factory=list)

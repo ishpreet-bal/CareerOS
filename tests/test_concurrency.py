@@ -360,7 +360,9 @@ def test_two_concurrent_sessions_never_duplicate_work(ctx: AppContext, cfg: AppC
     for task in ctx.orchestration.list_tasks(oid):
         attempts = [r.attempt for r in ctx.orchestration.list_results(task.id or 0)]
         assert len(attempts) == len(set(attempts))
-    assert len(adapter.calls) == len(rows)
+    # Every task model call the adapter served is one recorded row (reviews, required for
+    # research since C7, are separate calls of their own).
+    assert len([c for c in adapter.calls if c[1] != "quality.review"]) == len(rows)
 
 
 def test_gateway_idempotency_key_prevents_duplicate_calls(ctx: AppContext) -> None:

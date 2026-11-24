@@ -21,7 +21,7 @@ task_types:
   job.classify_role:        {base_complexity: 0.20, min_tier: 3, default_effort: none, expected_output_tokens: 120}
   job.analyze:              {base_complexity: 0.35, min_tier: 3, default_effort: none, expected_output_tokens: 300}
   eligibility.assess:       {min_quality: 0.85, base_complexity: 0.30, min_tier: 3, default_effort: none, expected_output_tokens: 200}
-  research.company:         {base_complexity: 0.50, min_tier: 2, default_effort: low, expected_input_tokens: 1500, expected_output_tokens: 500}
+  research.company:         {factual: true, base_complexity: 0.50, min_tier: 2, default_effort: low, expected_input_tokens: 1500, expected_output_tokens: 500}
   match.rationale:          {base_complexity: 0.40, min_tier: 3, default_effort: none, expected_output_tokens: 250}
   resume.tailor:            {min_quality: 0.80, base_complexity: 0.60, min_tier: 2, default_effort: low, important: true, expected_input_tokens: 1800, expected_output_tokens: 700}
   cover_letter.draft:       {min_quality: 0.75, base_complexity: 0.65, min_tier: 2, default_effort: medium, important: true, expected_input_tokens: 1500, expected_output_tokens: 600}

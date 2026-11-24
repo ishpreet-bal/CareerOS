@@ -213,7 +213,10 @@ def test_late_reply_racing_with_recovery_across_processes(ctx: AppContext) -> No
     ] == [2]
     spent, total = ledger_consistent(ctx, oid)
     assert spent == pytest.approx(total)
-    assert t["spent_usd"] == pytest.approx(sum(float(r["cost_usd"]) for r in rows))
+    # Task spend covers all of the task's calls, including its factual review (C7).
+    assert t["spent_usd"] == pytest.approx(
+        sum(float(r["cost_usd"]) for r in calls(ctx, task_id=t["id"]))
+    )
 
 
 def test_heartbeat_failure_in_a_separate_process_halts_then_recovers(ctx: AppContext) -> None:

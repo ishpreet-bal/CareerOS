@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from careeros.domain.models import ResultStatus, WorkerResult
 from careeros.llm.contracts import ModelRequest
+from careeros.quality.factual import evidence_instructions
 from careeros.workers.base import OutputValidationError, StepContext, WorkerRegistry
 
 SYSTEM_PROMPT = (
@@ -77,7 +78,13 @@ class ModelStepWorker:
         return ModelRequest(
             task_type=step.task_type,
             prompt="\n".join(parts),
-            system=SYSTEM_PROMPT,
+            # The evidence contract (audit L11) is part of the instructions: it is in the
+            # cache key and the replay hash, so a policy change never reuses old answers.
+            system=(
+                SYSTEM_PROMPT + "\n" + evidence_instructions(step.sources)
+                if step.factual
+                else SYSTEM_PROMPT
+            ),
             output_schema=step.output_schema,
         )
 

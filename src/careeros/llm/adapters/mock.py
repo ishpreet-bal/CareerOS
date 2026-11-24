@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal
 
@@ -53,6 +54,10 @@ class Outcome:
     kind: OutcomeKind
     quality: float | None = None  # forced hidden quality for success-like outcomes
     review_verdict: str | None = None  # forced verdict for review requests
+    #: Factual behaviour (audit L11): for an author, which claims/evidence to produce
+    #: (see ``_claims``); for a factual reviewer, ``omit`` (no per-claim verdicts) or
+    #: ``lax`` (every claim judged supported).
+    facts: str | None = None
 
 
 def success_probability(skill: float, effort: Effort, complexity: float) -> float:
@@ -173,6 +178,14 @@ class MockAdapter:
         rng: random.Random,
     ) -> dict[str, Any]:
         schema = request.output_schema
+        claims: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = [
+            {
+                "claim": f"Simulated finding for {request.task_type}",
+                "source_type": "user",
+                "source_ref": "simulation",
+            }
+        ]
         if schema.kind == "review":
             output = self._review_output(request, sim, rng, outcome)
             confidence = min(1.0, max(0.0, sim.skill + rng.uniform(0.0, 0.1)))
@@ -180,20 +193,23 @@ class MockAdapter:
             output = self._plan_output(request, quality)
         else:
             output = _fill_generic(schema, request.task_type, quality)
-        return {
+            if "factual_sources" in request.simulation:
+                claims, evidence = _claims(
+                    dict(request.simulation["factual_sources"]), outcome.facts or "ok"
+                )
+        payload: dict[str, Any] = {
             "output": output,
             "confidence": round(confidence, 3),
-            "evidence": [
-                {
-                    "claim": f"Simulated finding for {request.task_type}",
-                    "source_type": "user",
-                    "source_ref": "simulation",
-                }
-            ],
+            "evidence": evidence,
             "assumptions": ["Simulated output from an offline mock model."],
             "unresolved_questions": [] if quality >= 0.7 else ["Simulated gap in the answer."],
             "recommended_next_steps": [],
         }
+        if claims or "factual_sources" in request.simulation:
+            payload["claims"] = claims
+            if outcome.facts == "malformed":
+                payload["claims"] = "verified: the company is great"  # not a list
+        return payload
 
     @staticmethod
     def _review_output(
@@ -211,7 +227,11 @@ class MockAdapter:
         elif verdict == "revise":
             score = min(score, accept_at - 0.05)
         issues = [] if verdict == "accept" else ["Simulated: claims need more specific evidence."]
-        return {"verdict": verdict, "score": round(score, 3), "issues": issues}
+        out: dict[str, Any] = {"verdict": verdict, "score": round(score, 3), "issues": issues}
+        factual = request.simulation.get("factual_review")
+        if factual is not None and outcome.facts != "omit":
+            out["claim_verdicts"] = _judge_claims(factual, lax=outcome.facts == "lax")
+        return out
 
     @staticmethod
     def _plan_output(request: ModelRequest, quality: float) -> dict[str, Any]:
@@ -237,6 +257,118 @@ class MockAdapter:
             )
             prev = sid
         return {"steps": steps, "rationale": "Simulated plan: linear chain of known workers."}
+
+
+def _quote(text: str, words: int = 6) -> str:
+    return " ".join(text.split()[:words])
+
+
+def _claims(
+    sources: dict[str, str], variant: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Simulated author claims and evidence for a factual task (audit L11 test fixtures).
+
+    ``ok``: one verified claim per source (at most two), each quoting it verbatim, plus one
+    explicitly unverified claim. With no sources every claim is unverified. The other
+    variants each break one evidence rule: ``missing_evidence``, ``unknown_evidence``,
+    ``ungrounded`` (quote not in the source), ``web`` (a source CareerOS does not hold),
+    ``contradicted``, ``no_claims``, ``unverified_only``, ``overclaim`` (a grounded quote
+    that does not support the claim's number - only a reviewer can tell)."""
+    refs = list(sources)[:2]
+    if variant == "no_claims":
+        return [], []
+    if not refs or variant == "unverified_only":
+        return [
+            {"id": "c1", "text": "The employer's size is not stated.", "status": "unverified"}
+        ], []
+    claims: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    for i, ref in enumerate(refs, start=1):
+        quote = _quote(sources[ref])
+        claims.append(
+            {
+                "id": f"c{i}",
+                "text": f"The source says: {quote}",
+                "status": "verified",
+                "evidence": [f"e{i}"],
+            }
+        )
+        evidence.append(
+            {
+                "id": f"e{i}",
+                "claim": f"c{i}",
+                "source_type": "job_posting" if ref == "job_posting" else "user",
+                "source_ref": ref,
+                "quote": quote,
+                "stance": "supports",
+            }
+        )
+    first, e1 = claims[0], evidence[0]
+    if variant == "missing_evidence":
+        first["evidence"] = []
+    elif variant == "unknown_evidence":
+        first["evidence"] = ["e99"]
+    elif variant == "ungrounded":
+        e1["quote"] = "a sentence that appears in no source"
+    elif variant == "web":
+        e1["source_type"], e1["source_ref"] = "web", "https://example.invalid/about"
+    elif variant == "contradicted":
+        evidence.append(
+            {
+                "id": "e9",
+                "claim": "c1",
+                "source_type": e1["source_type"],
+                "source_ref": e1["source_ref"],
+                "quote": e1["quote"],
+                "stance": "contradicts",
+            }
+        )
+        first["evidence"] = ["e1", "e9"]
+    elif variant == "overclaim":
+        first["text"] = "The employer has 10000 employees."
+    claims.append(
+        {
+            "id": f"c{len(claims) + 1}",
+            "text": "Team culture is not described in the sources.",
+            "status": "unverified",
+        }
+    )
+    return claims, evidence
+
+
+def _judge_claims(subject: dict[str, Any], *, lax: bool) -> list[dict[str, Any]]:
+    """A simulated independent reviewer: for each verified claim, look at its own cited
+    evidence and the sources (not the author's labels) and judge it. Supported only if a
+    supporting quote occurs in its source and every number in the claim appears in a cited
+    quote; contradicted if any cited entry contradicts it."""
+    sources = {k: " ".join(str(v).lower().split()) for k, v in subject.get("sources", {}).items()}
+    evidence = {e.get("id"): e for e in subject.get("evidence", []) if isinstance(e, dict)}
+    out = []
+    for c in subject.get("claims", []):
+        if not isinstance(c, dict) or c.get("status") != "verified":
+            continue
+        cited = [evidence[i] for i in c.get("evidence", []) if i in evidence]
+        quotes = [
+            " ".join(str(e.get("quote") or "").lower().split())
+            for e in cited
+            if e.get("stance", "supports") == "supports"
+        ]
+        grounded = [
+            q
+            for q, e in zip(quotes, cited, strict=False)
+            if q and q in sources.get(str(e.get("source_ref")), "")
+        ]
+        numbers = re.findall(r"\d+", str(c.get("text", "")))
+        if lax:
+            verdict = "supported"
+        elif any(e.get("stance") == "contradicts" for e in cited):
+            verdict = "contradicted"
+        elif grounded and all(any(n in q for q in grounded) for n in numbers):
+            verdict = "supported"
+        else:
+            verdict = "unsupported"
+        out.append({"id": c.get("id"), "verdict": verdict})
+    return out
 
 
 def _fill_generic(schema: OutputSchema, task_type: str, quality: float) -> dict[str, Any]:

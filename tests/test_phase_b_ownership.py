@@ -153,7 +153,11 @@ def test_late_reply_after_takeover_never_overwrites_the_new_owner(
     # Money: task spend and every budget level match the ledger; nothing charged twice.
     spent, total = ledger_consistent(ctx, oid)
     assert spent == pytest.approx(total)
-    assert task["spent_usd"] == pytest.approx(sum(float(r["cost_usd"]) for r in rows))
+    # Task spend covers all of the task's calls (its task calls and, since C7, the factual
+    # review of its research result).
+    assert task["spent_usd"] == pytest.approx(
+        sum(float(r["cost_usd"]) for r in calls(ctx, task_id=task["id"]))
+    )
     assert ctx.db.query("SELECT * FROM budget_reservations WHERE status='held'") == []
 
 
@@ -635,7 +639,13 @@ def test_crash_inside_each_atomic_transition_rolls_back_completely(
     resumed.run(oid)
     t = _task(ctx, oid)
     ds = decisions(ctx, t["id"])
-    assert ds.count("recover") == 1 and ds.count(decision) == 1
+    task_routes = ctx.db.query(  # the review's own route decision (C7) is not the task's
+        "SELECT 1 FROM manager_decisions WHERE task_id=? AND decision='route'"
+        " AND COALESCE(json_extract(inputs, '$.purpose'), 'task') <> 'review'",
+        (t["id"],),
+    )
+    count = len(task_routes) if decision == "route" else ds.count(decision)
+    assert ds.count("recover") == 1 and count == 1
     if case in ("accept", "route"):
         assert t["status"] == "succeeded" and len(calls(ctx, purpose="task")) == 1
         assert ctx.db.query_one("SELECT SUM(attempts) AS n FROM routing_stats")["n"] == 1

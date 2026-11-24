@@ -86,11 +86,11 @@ def run_scenario(ctx: AppContext, name: str) -> ScenarioResult:
         return ScenarioResult(oid, m.events)
 
     if name == "budget":
-        # Enough budget (sized for worst-case reservations) for everything except the final
-        # *critical* review, which must not be downgraded: the manager stops and asks; the
-        # simulated user approves.
+        # Enough budget (sized for worst-case reservations, including the factual review of
+        # the research step, C7) for everything except the final *critical* review, which
+        # must not be downgraded: the manager stops and asks; the simulated user approves.
         m = _manager(ctx, MockAdapter())
-        oid = m.submit(ObjectiveRequest(**{**request.__dict__, "budget_usd": 0.15}))
+        oid = m.submit(ObjectiveRequest(**{**request.__dict__, "budget_usd": 0.18}))
         m.run(oid)
         asked = m.pending_requests(oid)
         events = list(m.events)

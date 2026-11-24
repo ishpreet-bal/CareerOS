@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from careeros.domain.models import WorkerResult
@@ -30,6 +30,10 @@ class StepContext:
     output_schema: OutputSchema
     #: Feedback from a failed attempt (validation errors, reviewer issues).
     feedback: str | None = None
+    #: Factual task: the result must meet the evidence policy (audit L11) against
+    #: ``sources`` - the texts CareerOS holds for this task, keyed by ``source_ref``.
+    factual: bool = False
+    sources: dict[str, str] = field(default_factory=dict)
 
 
 class DeterministicWorker(Protocol):
