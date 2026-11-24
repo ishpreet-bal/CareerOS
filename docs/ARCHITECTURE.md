@@ -1165,7 +1165,7 @@ overshoot_usd`, `tasks.approved_review_floor`, and the `withdrawn` request statu
 | **H2** writes not fenced by lease ownership; late replies after takeover | Fixed in Phase B (§18) |
 | **M4** heartbeat thread can die silently | Fixed in Phase B (§18) |
 | **M5** multi-statement state transitions (`_block`, `_accept`, `_apply`, recovery) not atomic | Fixed in Phase B (§18) |
-| L1–L12 (audit) | Unchanged except where noted above; see the audit report |
+| L1–L12 (audit) | L1, L4 fixed in Phase B; the rest are closed in the M3 hardening stage (§19, `docs/audits/m3-hardening.md`) |
 
 ### 17.3 New behaviour to be aware of
 
@@ -1268,3 +1268,33 @@ deleting them, and re-points reviews of archived results.
    live process's in-flight work.
 5. SQLite: single writer; WAL requires a local filesystem.
 
+
+---
+
+## 19. M3 hardening and audit closure
+
+Baseline: `e67b011` (Phase B approved). The stage is split into phases C1–C8, each with
+regression tests written first against the baseline. Status per finding is tracked in
+[`docs/audits/m3-hardening.md`](audits/m3-hardening.md).
+
+### 19.1 C1 — conditional state transitions (L3, L10, N1, N2)
+
+Rule: every objective, approval-request and task transition outside an owned (fenced) task
+transaction is **conditional on the state it expects** and decided **inside one write
+transaction**. A stale or concurrent caller changes nothing and is told so.
+
+| Transition | Before | Now |
+|---|---|---|
+| Finish an objective (`finish_objective[_in]`, `_finish`) | Status written unconditionally; a stale "done" could overwrite the user's stop, and a second stop decision was recorded | Objective status changes first and only from `active`/`awaiting_human`; if that loses, nothing else is written and the caller gets the reason actually in effect |
+| Wait for the user (`_settle_idle`) | Unconditional | Only from `active` (`set_objective_status(..., only_from=...)`) |
+| Objective-level request (`_request_user`) | Reopened a finished objective to `awaiting_human` | Objective changes only while open; otherwise the new request is recorded as withdrawn |
+| Approve / deny | Validated in one step, written in another, writes keyed by id only: two decisions on one request could both apply (double budget increase, approve *and* deny, reopening a finished objective) | Validation and all writes in one `BEGIN IMMEDIATE` transaction; the request resolves only `WHERE status='pending'`, the task is released or failed only from the blocked state the request was for, the objective reopens only while open, and deny finishes the objective in the same transaction. Any mismatch aborts the whole decision |
+| End a session (`end_session`) | Overwrote an earlier "presumed dead (recovered)" end | Keeps the first end time and reason |
+| Claim a task (`fencing.claim`) | Task status only | `CLAIMABLE_SQL`: runnable status **and** objective `active` **and** every prerequisite succeeded, checked in the claiming statement (mirrors `_ready_tasks`; a differential test checks they agree at every step of every shipped playbook) |
+
+Behaviour change: a request whose kind has no specific blocked state (none are created with
+a task today) can be decided only while its task is `blocked_budget` or `awaiting_human`.
+
+Not changed in C1 (scheduled): plan installation is not atomic and task rows are not
+versioned by plan, so "task belongs to the current plan" is not yet a claim condition — that
+is part of C5 (finding N5).

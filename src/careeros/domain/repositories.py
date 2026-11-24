@@ -285,9 +285,12 @@ class OrchestrationRepository:
         return sid
 
     def end_session(self, session_id: str, reason: str = "completed") -> None:
+        """Mark a session ended. A session already ended (e.g. presumed dead by another
+        session's recovery) keeps its first end time and reason (finding N2)."""
         with self.db.transaction() as c:
             c.execute(
-                "UPDATE execution_sessions SET ended_at=?, end_reason=? WHERE id=?",
+                "UPDATE execution_sessions SET ended_at=COALESCE(ended_at, ?),"
+                " end_reason=CASE WHEN ended_at IS NULL THEN ? ELSE end_reason END WHERE id=?",
                 (utc_now_iso(), reason, session_id),
             )
 
@@ -346,16 +349,34 @@ class OrchestrationRepository:
         return [self._row_objective(r) for r in rows]
 
     def set_objective_status(
-        self, objective_id: int, status: ObjectiveStatus, stop_reason: str | None = None
-    ) -> None:
+        self,
+        objective_id: int,
+        status: ObjectiveStatus,
+        stop_reason: str | None = None,
+        *,
+        only_from: tuple[ObjectiveStatus, ...] | None = None,
+    ) -> bool:
+        """Set an objective's status. With ``only_from`` the change is conditional on the
+        current status (audit L3); returns whether the row changed."""
         now = utc_now_iso()
         done = now if status in (ObjectiveStatus.DONE, ObjectiveStatus.STOPPED) else None
+        allowed = [s.value for s in only_from] if only_from is not None else None
         with self.db.transaction() as c:
-            c.execute(
+            cur = c.execute(
                 "UPDATE objectives SET status=?, stop_reason=?, updated_at=?,"
-                " completed_at=COALESCE(?, completed_at) WHERE id=?",
-                (status.value, stop_reason, now, done, objective_id),
+                " completed_at=COALESCE(?, completed_at) WHERE id=?"
+                " AND (? IS NULL OR status IN (SELECT value FROM json_each(?)))",
+                (
+                    status.value,
+                    stop_reason,
+                    now,
+                    done,
+                    objective_id,
+                    None if allowed is None else 1,
+                    to_json(allowed or []),
+                ),
             )
+        return cur.rowcount == 1
 
     # ---------------------------------------------------------------- plans
     def create_plan(self, plan: Plan) -> Plan:
@@ -446,50 +467,61 @@ class OrchestrationRepository:
 
     def finish_objective(
         self, objective_id: int, status: ObjectiveStatus, reason: str
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int] | None:
         """Finish an objective consistently, in one transaction (audit M3).
 
-        Cancels every task that has not finished (including tasks blocked on budget or
-        awaiting the user), withdraws every pending approval request, sets the objective's
-        final status and records the stop decision. Returns (tasks cancelled, requests
-        withdrawn).
-        """
-        now = utc_now_iso()
+        Returns (tasks cancelled, requests withdrawn), or None if the objective was no
+        longer open - another decision finished it first and is left untouched (L3)."""
         with self.db.transaction() as c:
-            cancelled = c.execute(
-                "UPDATE tasks SET status='cancelled', last_error=?, lease_owner=NULL,"
-                " lease_expires_at=NULL, updated_at=?, finished_at=? WHERE objective_id=?"
-                " AND status NOT IN ('succeeded','failed','cancelled','skipped')",
-                ("not needed: objective finished", now, now, objective_id),
-            ).rowcount
-            withdrawn = c.execute(
-                "UPDATE approval_requests SET status='withdrawn', resolution=?, resolved_at=?"
-                " WHERE objective_id=? AND status='pending'",
-                (f"objective {status.value}: {reason}"[:300], now, objective_id),
-            ).rowcount
-            c.execute(
-                "UPDATE objectives SET status=?, stop_reason=?, updated_at=?,"
-                " completed_at=COALESCE(completed_at, ?) WHERE id=?",
-                (status.value, reason, now, now, objective_id),
-            )
-            c.execute(
-                "INSERT INTO manager_decisions (objective_id, task_id, decision, rationale,"
-                " inputs, created_at) VALUES (?,?,?,?,?,?)",
-                (
-                    objective_id,
-                    None,
-                    "stop",
-                    reason,
-                    to_json(
-                        {
-                            "status": status.value,
-                            "tasks_cancelled": cancelled,
-                            "requests_withdrawn": withdrawn,
-                        }
-                    ),
-                    now,
+            return self.finish_objective_in(c, objective_id, status, reason)
+
+    @staticmethod
+    def finish_objective_in(
+        c: sqlite3.Connection, objective_id: int, status: ObjectiveStatus, reason: str
+    ) -> tuple[int, int] | None:
+        """Inside the caller's transaction: only an open objective is finished. Its
+        final status is set first and conditionally, so a stale caller (e.g. one whose
+        snapshot said "done" after the user stopped it) changes nothing. Otherwise every
+        unfinished task is cancelled (including tasks blocked on budget or awaiting the
+        user), every pending request is withdrawn and the stop decision recorded."""
+        now = utc_now_iso()
+        won = c.execute(
+            "UPDATE objectives SET status=?, stop_reason=?, updated_at=?,"
+            " completed_at=COALESCE(completed_at, ?) WHERE id=?"
+            " AND status IN ('active','awaiting_human')",
+            (status.value, reason, now, now, objective_id),
+        ).rowcount
+        if won != 1:
+            return None
+        cancelled = c.execute(
+            "UPDATE tasks SET status='cancelled', last_error=?, lease_owner=NULL,"
+            " lease_expires_at=NULL, updated_at=?, finished_at=? WHERE objective_id=?"
+            " AND status NOT IN ('succeeded','failed','cancelled','skipped')",
+            ("not needed: objective finished", now, now, objective_id),
+        ).rowcount
+        withdrawn = c.execute(
+            "UPDATE approval_requests SET status='withdrawn', resolution=?, resolved_at=?"
+            " WHERE objective_id=? AND status='pending'",
+            (f"objective {status.value}: {reason}"[:300], now, objective_id),
+        ).rowcount
+        c.execute(
+            "INSERT INTO manager_decisions (objective_id, task_id, decision, rationale,"
+            " inputs, created_at) VALUES (?,?,?,?,?,?)",
+            (
+                objective_id,
+                None,
+                "stop",
+                reason,
+                to_json(
+                    {
+                        "status": status.value,
+                        "tasks_cancelled": cancelled,
+                        "requests_withdrawn": withdrawn,
+                    }
                 ),
-            )
+                now,
+            ),
+        )
         return cancelled, withdrawn
 
     def current_plan(self, objective_id: int) -> Plan | None:

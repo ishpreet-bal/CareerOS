@@ -557,8 +557,9 @@ class CareerManager:
                         stop_reason = obj.stop_reason
                         break
                     if done_now:
-                        self._finish(obj, ObjectiveStatus.DONE, "definition of done met")
-                        stop_reason = "definition of done met"
+                        stop_reason = self._finish(
+                            obj, ObjectiveStatus.DONE, "definition of done met"
+                        )
                         break
                     if not quota_left:
                         stop_reason = "attempt limit for this invocation"
@@ -910,16 +911,20 @@ class CareerManager:
             self._log("Some tasks are running in another live session; nothing to do here.")
             return "tasks are running in another session"
         if any(t.status in (TaskStatus.AWAITING_HUMAN, TaskStatus.BLOCKED_BUDGET) for t in tasks):
-            self.repo.set_objective_status(
-                obj.id, ObjectiveStatus.AWAITING_HUMAN, "waiting for the user's decision"
-            )
+            if not self.repo.set_objective_status(
+                obj.id,
+                ObjectiveStatus.AWAITING_HUMAN,
+                "waiting for the user's decision",
+                only_from=(ObjectiveStatus.ACTIVE,),
+            ):  # decided meanwhile (e.g. stopped by the user): leave that decision alone
+                return self.repo.get_objective(obj.id).stop_reason or "objective changed"
             self._log("Objective is waiting for your decision (see approvals).")
             return "waiting for the user's decision"
         if self._done(obj):
-            self._finish(obj, ObjectiveStatus.DONE, "definition of done met")
-            return "definition of done met"
-        self._finish(obj, ObjectiveStatus.FAILED, "no runnable work and definition of done unmet")
-        return "no runnable work and definition of done unmet"
+            return self._finish(obj, ObjectiveStatus.DONE, "definition of done met")
+        return self._finish(
+            obj, ObjectiveStatus.FAILED, "no runnable work and definition of done unmet"
+        )
 
     # ---------------------------------------------------------------- definition of done
     def _done(self, obj: Objective) -> bool:
@@ -946,12 +951,24 @@ class CareerManager:
         r = self.db.query_one("SELECT optional FROM tasks WHERE id=?", (t.id,))
         return bool(r and r["optional"])
 
-    def _finish(self, obj: Objective, status: ObjectiveStatus, reason: str) -> None:
+    def _finish(self, obj: Objective, status: ObjectiveStatus, reason: str) -> str:
         """Objective, tasks and approval requests reach a consistent final state together
         (audit M3): unfinished tasks are cancelled - including ones blocked on budget or
-        awaiting the user - and pending requests are withdrawn, in one transaction."""
+        awaiting the user - and pending requests are withdrawn, in one transaction.
+
+        Conditional on the objective still being open (audit L3): if another decision
+        finished it first (``obj`` is a stale snapshot), nothing changes. Returns the
+        stop reason actually in effect."""
         assert obj.id is not None
-        cancelled, withdrawn = self.repo.finish_objective(obj.id, status, reason)
+        result = self.repo.finish_objective(obj.id, status, reason)
+        if result is None:
+            current = self.repo.get_objective(obj.id)
+            self._log(
+                f"Objective {obj.id} was already {current.status.value} "
+                f"({current.stop_reason}); not marked {status.value}"
+            )
+            return current.stop_reason or current.status.value
+        cancelled, withdrawn = result
         extra = []
         if cancelled:
             extra.append(f"{cancelled} unneeded task(s) cancelled")
@@ -961,6 +978,7 @@ class CareerManager:
             f"Objective {obj.id} {status.value}: {reason}"
             + (f" ({'; '.join(extra)})" if extra else "")
         )
+        return reason
 
     # ================================================================ task execution
     def _step(self, task: Task) -> StepSpec:
@@ -1835,15 +1853,24 @@ class CareerManager:
     def _request_user(
         self, objective_id: int, task_id: int | None, kind: str, details: dict[str, Any]
     ) -> int:
-        """Objective-level requests (e.g. planning clarification), not tied to an owner."""
+        """Objective-level requests (e.g. planning clarification), not tied to an owner.
+
+        The objective waits for the user only if it is still open (audit L3); a question
+        raised after another decision finished it is recorded as withdrawn."""
         with self.db.transaction() as c:
             rid = self.repo.request_user_in(c, objective_id, task_id, kind, details)
             if task_id is None:
-                c.execute(
+                cur = c.execute(
                     "UPDATE objectives SET status='awaiting_human', stop_reason=?, updated_at=?"
-                    " WHERE id=?",
+                    " WHERE id=? AND status IN ('active','awaiting_human')",
                     (str(details.get("message", kind)), self._now(), objective_id),
                 )
+                if cur.rowcount != 1:
+                    c.execute(
+                        "UPDATE approval_requests SET status='withdrawn', resolution=?,"
+                        " resolved_at=? WHERE id=?",
+                        ("withdrawn: objective already finished", self._now(), rid),
+                    )
         return rid
 
     def _prune_in(
@@ -1917,34 +1944,100 @@ class CareerManager:
         "budget_increase": TaskStatus.BLOCKED_BUDGET,
         "retry_limit": TaskStatus.AWAITING_HUMAN,
     }
+    #: States a task may be in while any other kind of request about it is pending.
+    _WAITING: ClassVar[tuple[str, ...]] = ("blocked_budget", "awaiting_human")
 
-    def _validate_request(self, request_id: int) -> Any:
-        """A request can only be decided while it is pending, its objective is unfinished
-        and its task is still in the blocked state the request was made for. Obsolete
-        requests are withdrawn rather than applied (audit M3)."""
-        r = self.db.query_one("SELECT * FROM approval_requests WHERE id=?", (request_id,))
+    def _validate_request(self, request_id: int, c: sqlite3.Connection) -> tuple[Any, str | None]:
+        """Inside the deciding transaction: (request, problem). A request can only be
+        decided while it is pending, its objective is unfinished and its task is still in
+        the blocked state the request was made for. Because the check and the decision
+        share one write transaction, two decisions on one request cannot both pass it
+        (finding N1)."""
+        r = c.execute("SELECT * FROM approval_requests WHERE id=?", (request_id,)).fetchone()
         if r is None:
             raise NotFoundError(f"Approval request {request_id} not found")
         if r["status"] != "pending":
             raise CareerOSError(f"Approval request {request_id} is already {r['status']}")
-        obj = self.repo.get_objective(r["objective_id"])
+        obj = c.execute("SELECT status FROM objectives WHERE id=?", (r["objective_id"],)).fetchone()
         problem = None
-        if obj.status not in (ObjectiveStatus.ACTIVE, ObjectiveStatus.AWAITING_HUMAN):
-            problem = f"objective {obj.id} is already {obj.status.value}"
+        if obj["status"] not in ("active", "awaiting_human"):
+            problem = f"objective {r['objective_id']} is already {obj['status']}"
         elif r["task_id"] is not None:
-            task = self.repo.get_task(r["task_id"])
+            t = c.execute("SELECT status FROM tasks WHERE id=?", (r["task_id"],)).fetchone()
             expected = self._BLOCKED_STATE.get(r["kind"])
-            if expected is not None and task.status is not expected:
-                problem = f"task {task.id} is {task.status.value}, no longer {expected.value}"
-        if problem is not None:
-            with self.db.transaction() as c:
+            allowed = (expected.value,) if expected is not None else self._WAITING
+            if t["status"] not in allowed:
+                problem = f"task {r['task_id']} is {t['status']}, no longer {'/'.join(allowed)}"
+        return r, problem
+
+    def _decide_request(
+        self, request_id: int, apply: Callable[[sqlite3.Connection, Any], None]
+    ) -> Any:
+        """Validate and decide a request in one write transaction. An obsolete request is
+        withdrawn (and that withdrawal committed) instead of being applied."""
+        with self.db.transaction() as c:
+            r, problem = self._validate_request(request_id, c)
+            if problem is None:
+                apply(c, r)
+            else:
                 c.execute(
                     "UPDATE approval_requests SET status='withdrawn', resolution=?,"
                     " resolved_at=? WHERE id=? AND status='pending'",
                     (f"withdrawn: {problem}", utc_now_iso(), request_id),
                 )
+        if problem is not None:
             raise CareerOSError(f"Approval request {request_id} is obsolete: {problem}.")
         return r
+
+    @staticmethod
+    def _resolve_in(
+        c: sqlite3.Connection, request_id: int, status: str, resolution: str, now: str
+    ) -> None:
+        """Conditionally resolve a pending request; anything else aborts the decision."""
+        cur = c.execute(
+            "UPDATE approval_requests SET status=?, resolution=?, resolved_at=?"
+            " WHERE id=? AND status='pending'",
+            (status, resolution, now, request_id),
+        )
+        if cur.rowcount != 1:
+            raise CareerOSError(f"Approval request {request_id} was decided concurrently")
+
+    def _release_task_in(
+        self,
+        c: sqlite3.Connection,
+        task_id: int,
+        kind: str,
+        now: str,
+        column: str | None = None,
+        value: float | None = None,
+    ) -> None:
+        """Make a blocked task runnable again, only from the state the request was for."""
+        expected = self._BLOCKED_STATE.get(kind)
+        allowed = [expected.value] if expected is not None else list(self._WAITING)
+        if column is None:
+            cur = c.execute(
+                "UPDATE tasks SET status='ready', updated_at=? WHERE id=?"
+                " AND status IN (SELECT value FROM json_each(?))",
+                (now, task_id, to_json(allowed)),
+            )
+        else:
+            cur = c.execute(
+                f"UPDATE tasks SET {column}=?, status='ready', updated_at=? WHERE id=?"  # noqa: S608
+                " AND status IN (SELECT value FROM json_each(?))",
+                (value, now, task_id, to_json(allowed)),
+            )
+        if cur.rowcount != 1:
+            raise CareerOSError(f"Task {task_id} changed state while the request was decided")
+
+    @staticmethod
+    def _reopen_in(c: sqlite3.Connection, objective_id: int, now: str) -> None:
+        cur = c.execute(
+            "UPDATE objectives SET status='active', stop_reason=NULL, updated_at=? WHERE id=?"
+            " AND status IN ('active','awaiting_human')",
+            (now, objective_id),
+        )
+        if cur.rowcount != 1:
+            raise CareerOSError(f"Objective {objective_id} finished while the request was decided")
 
     def approve(
         self,
@@ -1959,13 +2052,13 @@ class CareerManager:
         For a budget request the user either adds (simulated) budget, or with
         ``accept_downgrade`` explicitly accepts the best affordable lower-quality option the
         request offered. The downgrade applies only to the routing step that asked for it
-        (the task itself, or its review). Everything is written in one transaction.
+        (the task itself, or its review). Validation and every write are one transaction,
+        each write conditional on the state it expects (audit L3, finding N1).
         """
-        r = self._validate_request(request_id)
-        kind, obj_id, task_id = r["kind"], r["objective_id"], r["task_id"]
-        details = from_json(r["details"], {})
-        now = utc_now_iso()
-        if accept_downgrade:
+
+        def downgrade(c: sqlite3.Connection, r: Any) -> None:
+            kind, obj_id, task_id = r["kind"], r["objective_id"], r["task_id"]
+            details = from_json(r["details"], {})
             option = details.get("downgrade_option")
             purpose = details.get("route_purpose", "task")
             if kind != "budget_increase" or not option or task_id is None:
@@ -1974,61 +2067,52 @@ class CareerManager:
                 raise CareerOSError(f"Downgrades cannot be approved for {purpose} routing.")
             column = "approved_floor" if purpose == "task" else "approved_review_floor"
             floor_to = float(option["p_accept"])
-            with self.db.transaction() as c:
-                c.execute(
-                    "UPDATE approval_requests SET status='approved', resolution=?,"
-                    " resolved_at=? WHERE id=?",
-                    (f"accept_downgrade:{purpose}", now, request_id),
-                )
-                c.execute(
-                    "INSERT INTO approvals (kind, scope, details, granted_at) VALUES (?,?,?,?)",
-                    (
-                        "quality_downgrade",
-                        f"objective:{obj_id}/task:{task_id}/{purpose}",
-                        to_json(
-                            {
-                                "request_id": request_id,
-                                "route_purpose": purpose,
-                                "floor_from": details.get("quality_floor"),
-                                "floor_to": floor_to,
-                                "option": option,
-                            }
-                        ),
-                        now,
-                    ),
-                )
-                c.execute(
-                    f"UPDATE tasks SET {column}=?, status='ready', updated_at=? WHERE id=?",  # noqa: S608
-                    (max(0.0, floor_to - 1e-9), now, task_id),
-                )
-                c.execute(
-                    "UPDATE objectives SET status='active', stop_reason=NULL, updated_at=?"
-                    " WHERE id=?",
-                    (now, obj_id),
-                )
-                c.execute(
-                    "INSERT INTO manager_decisions (objective_id, task_id, decision, rationale,"
-                    " inputs, created_at) VALUES (?,?,?,?,?,?)",
-                    (
-                        obj_id,
-                        task_id,
-                        "approve_downgrade",
-                        f"user accepted a {purpose} quality downgrade: floor "
-                        f"{details.get('quality_floor')} -> {floor_to:.3f}",
-                        to_json(
-                            {"request_id": request_id, "route_purpose": purpose, "option": option}
-                        ),
-                        now,
-                    ),
-                )
-            return
-        if kind == "budget_increase" and extra_usd <= 0:
-            raise CareerOSError("A budget approval needs a positive simulated amount.")
-        with self.db.transaction() as c:
+            now = utc_now_iso()
+            self._resolve_in(c, request_id, "approved", f"accept_downgrade:{purpose}", now)
             c.execute(
-                "UPDATE approval_requests SET status='approved', resolution=?, resolved_at=?"
-                " WHERE id=?",
-                ("budget_increase" if kind == "budget_increase" else "approved", now, request_id),
+                "INSERT INTO approvals (kind, scope, details, granted_at) VALUES (?,?,?,?)",
+                (
+                    "quality_downgrade",
+                    f"objective:{obj_id}/task:{task_id}/{purpose}",
+                    to_json(
+                        {
+                            "request_id": request_id,
+                            "route_purpose": purpose,
+                            "floor_from": details.get("quality_floor"),
+                            "floor_to": floor_to,
+                            "option": option,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            self._release_task_in(c, task_id, kind, now, column, max(0.0, floor_to - 1e-9))
+            self._reopen_in(c, obj_id, now)
+            c.execute(
+                "INSERT INTO manager_decisions (objective_id, task_id, decision, rationale,"
+                " inputs, created_at) VALUES (?,?,?,?,?,?)",
+                (
+                    obj_id,
+                    task_id,
+                    "approve_downgrade",
+                    f"user accepted a {purpose} quality downgrade: floor "
+                    f"{details.get('quality_floor')} -> {floor_to:.3f}",
+                    to_json({"request_id": request_id, "route_purpose": purpose, "option": option}),
+                    now,
+                ),
+            )
+
+        def grant(c: sqlite3.Connection, r: Any) -> None:
+            kind, obj_id, task_id = r["kind"], r["objective_id"], r["task_id"]
+            if kind == "budget_increase" and extra_usd <= 0:
+                raise CareerOSError("A budget approval needs a positive simulated amount.")
+            now = utc_now_iso()
+            self._resolve_in(
+                c,
+                request_id,
+                "approved",
+                "budget_increase" if kind == "budget_increase" else "approved",
+                now,
             )
             c.execute(
                 "INSERT INTO approvals (kind, scope, details, max_usd, granted_at)"
@@ -2059,32 +2143,51 @@ class CareerManager:
                     (extra_attempts, task_id),
                 )
             if task_id is not None:
-                c.execute(
-                    "UPDATE tasks SET status='ready', updated_at=? WHERE id=?", (now, task_id)
-                )
-            c.execute(
-                "UPDATE objectives SET status='active', stop_reason=NULL, updated_at=? WHERE id=?",
-                (now, obj_id),
-            )
+                self._release_task_in(c, task_id, kind, now)
+            self._reopen_in(c, obj_id, now)
+
+        self._decide_request(request_id, downgrade if accept_downgrade else grant)
 
     def deny(self, request_id: int) -> None:
-        """Decline a request: its task fails and the objective stops, consistently."""
-        r = self._validate_request(request_id)
-        now = utc_now_iso()
-        with self.db.transaction() as c:
-            c.execute(
-                "UPDATE approval_requests SET status='denied', resolution='denied',"
-                " resolved_at=? WHERE id=?",
-                (now, request_id),
-            )
+        """Decline a request: its task fails and the objective stops - validated and
+        applied in one transaction, so it cannot race an approval (finding N1)."""
+        outcome: list[tuple[int, int]] = []
+
+        def refuse(c: sqlite3.Connection, r: Any) -> None:
+            now = utc_now_iso()
+            self._resolve_in(c, request_id, "denied", "denied", now)
             if r["task_id"] is not None:
-                c.execute(
+                expected = self._BLOCKED_STATE.get(r["kind"])
+                allowed = [expected.value] if expected is not None else list(self._WAITING)
+                cur = c.execute(
                     "UPDATE tasks SET status='failed', last_error='denied by user', updated_at=?,"
-                    " finished_at=? WHERE id=?",
-                    (now, now, r["task_id"]),
+                    " finished_at=? WHERE id=? AND status IN (SELECT value FROM json_each(?))",
+                    (now, now, r["task_id"], to_json(allowed)),
                 )
-        self._finish(
-            self.repo.get_objective(r["objective_id"]),
-            ObjectiveStatus.STOPPED,
-            "user declined the request",
+                if cur.rowcount != 1:
+                    raise CareerOSError(
+                        f"Task {r['task_id']} changed state while the request was decided"
+                    )
+            result = self.repo.finish_objective_in(
+                c, r["objective_id"], ObjectiveStatus.STOPPED, "user declined the request"
+            )
+            if result is None:
+                raise CareerOSError(
+                    f"Objective {r['objective_id']} finished while the request was decided"
+                )
+            outcome.append(result)
+
+        r = self._decide_request(request_id, refuse)
+        cancelled, withdrawn = outcome[0]
+        extra = [
+            text
+            for n, text in (
+                (cancelled, f"{cancelled} unneeded task(s) cancelled"),
+                (withdrawn, f"{withdrawn} pending request(s) withdrawn"),
+            )
+            if n
+        ]
+        self._log(
+            f"Objective {r['objective_id']} stopped: user declined the request"
+            + (f" ({'; '.join(extra)})" if extra else "")
         )

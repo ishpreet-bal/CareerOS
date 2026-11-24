@@ -251,3 +251,24 @@ def open_fresh(path: str, barrier: Any, out: Any) -> None:
             _report(out, version=db.schema_version(), kind=db.dataset_kind)
     except BaseException:
         _report(out, error=traceback.format_exc())
+
+
+def decide_request(data_dir: str, request_id: int, action: str, barrier: Any, out: Any) -> None:
+    """Approve (+$1, simulated) or deny one approval request, in step with other
+    processes doing the same."""
+    try:
+        from careeros.core.errors import CareerOSError
+
+        with _ctx(data_dir) as c:
+            m = _manager(c, None)
+            barrier.wait(30)
+            try:
+                if action == "approve":
+                    m.approve(request_id, extra_usd=1.0)
+                else:
+                    m.deny(request_id)
+                _report(out, action=action, result="ok")
+            except CareerOSError as exc:
+                _report(out, action=action, result="refused", reason=str(exc))
+    except BaseException:
+        _report(out, error=traceback.format_exc())
