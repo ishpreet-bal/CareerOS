@@ -21,6 +21,7 @@ fails on the baseline passes after the change, and CI is green on the fixing com
 | N4 | Cached accepted results skip review (factual policy version) | C7 | Open |
 | L6 | Worker-failure/T2 failure paths | C8 | Verified consistent by inspection; failure-injection tests pending |
 | T1 | Timing-sensitive heartbeat test | C8 | Open — brief below |
+| T2 | `test_backup_while_in_use_is_consistent_and_does_not_disturb_workers` (C4) asserted exactly one in-flight call in the snapshot; the second, concurrent step's call can also be in flight (seen on CI run #14) | C5 | **Fixed**: asserts the snapshot's consistency instead (every in-flight call has exactly its own held reservation); 10/10 under CPU load |
 
 ## C1 evidence (`523c227`, CI run #8 green: lint, type-check and full test job)
 

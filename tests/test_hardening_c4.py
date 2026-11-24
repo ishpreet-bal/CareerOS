@@ -241,18 +241,22 @@ def test_backup_while_in_use_is_consistent_and_does_not_disturb_workers(
         assert verify_backup(b.path).ok
         _invariants(b.path, oid)
         conn = sqlite3.connect(str(b.path))
-        try:  # the snapshot holds the in-flight state exactly as committed
+        try:  # the snapshot holds the in-flight state exactly as committed: the held
+            # call (and possibly the other step's, which runs concurrently) is in flight,
+            # and every in-flight call has exactly its own held reservation (T1 atomicity)
+            in_flight = conn.execute(
+                "SELECT COUNT(*) FROM model_calls WHERE status='in_flight'"
+            ).fetchone()[0]
+            held = conn.execute(
+                "SELECT COUNT(*) FROM budget_reservations WHERE status='held'"
+            ).fetchone()[0]
+            assert in_flight >= 1 and held == in_flight, (in_flight, held)
             assert (
                 conn.execute(
-                    "SELECT COUNT(*) FROM model_calls WHERE status='in_flight'"
+                    "SELECT COUNT(*) FROM model_calls m JOIN budget_reservations r"
+                    " ON r.id = m.reservation_id WHERE m.status='in_flight' AND r.status='held'"
                 ).fetchone()[0]
-                == 1
-            )
-            assert (
-                conn.execute(
-                    "SELECT COUNT(*) FROM budget_reservations WHERE status='held'"
-                ).fetchone()[0]
-                >= 1
+                == in_flight
             )
             assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"  # one file
         finally:
